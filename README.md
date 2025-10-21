@@ -1,0 +1,153 @@
+# Recur — Permissioned Pull for Digital Value
+### The open standard for consented continuity (RIP-001)
+
+**Recur** defines the first general-purpose *permissioned-pull* primitive for ERC-20 (and other EVM assets).  
+It lets value flow safely and continuously — **before failure, not after** — via explicit, revocable consent.
+
+---
+
+## Overview
+
+Push-based payments react after imbalance. That delay creates volatility and operational risk.  
+Recur introduces **pull within consent**: the grantor signs an EIP-712 authorization, the grantee can pull within limits, and the grantor can revoke instantly. Consent becomes structure.
+
+This repository is the **canonical reference** for **RIP-001**, including:
+- `contracts/RecurPull.sol` — minimal standard primitive
+- `contracts/RecurPullSafeV2.sol` — hardened template for pilots
+- `docs/RIP-001.md` — specification
+- `docs/RIP-002.md` — *Authorization Registry & Events* (optional index, draft)
+- `docs/AUDIT_SUMMARY.md` — informal review notes
+- `tests/` — test scaffold notes
+
+License: **Apache-2.0**. No token. Open standard.
+
+---
+
+## ⚙️ Quick Start
+
+### 1) Install & build (Foundry or Hardhat)
+```bash
+forge build
+```
+or with hardhat: 
+
+``` bash
+npm i && npx hardhat compile
+```
+
+### 2) Import the primitive (or the safe template)
+
+~~~
+
+import "./contracts/RecurPull.sol";          // minimal primitive (standard)
+import "./contracts/RecurPullSafeV2.sol";    // recommended for pilots
+
+~~~
+
+### 3) Grantor signs an Authorization (EIP-712)
+
+~~~
+
+Authorization {
+  grantor:    0xSender,
+  grantee:    0xReceiver,   // must be msg.sender in pull()
+  token:      0xToken,
+  maxAmount:  1000e18,      // total cap (SafeV2) or per-call (primitive)
+  validAfter: 1720000000,
+  validBefore:1730000000,
+  nonce:      keccak256("unique")
+}
+
+~~~
+
+### 4) Grantee pulls within consent
+
+~~~
+
+pull(auth, amount, signature);          // requires allowance
+pullWithPermit(auth, amount, sig, data);// for ERC-2612 tokens (SafeV2)
+
+~~~
+
+### 5) Grantor can revoke at any time
+
+~~~
+
+revoke(auth);                 // SafeV2 (bound to grantor)
+revoke(authHash);             // primitive (hash-based)
+
+~~~
+
+See docs/RIP-001.md for full semantics.
+
+---
+
+## Contracts
+
+| **Contract**             | **Purpose**                 | **Notes**                                                                                                                                                                                                                                                                             |
+|----------------------|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **RecurPull.sol**    | Minimal RIP-001 reference | Smallest surface to audit/extend. Includes **EIP-712** authorization, `verify → pull` flow, and simple revoke. Perfect for understanding & composing your own modules.                                                                    |
+| **RecurPullSafeV2.sol** | Hardened pilot template  | Adds cumulative cap, revocation bound to grantor, **EIP-1271** smart wallet support, optional **ERC-2612** `permit()`, reentrancy guard, and helper functions. Recommended starting point for pilots.                                      |
+
+Both implement the same **authorize → verify → pull → revoke** logic that defines the permissioned-pull standard.
+
+---
+
+## Folder Structure
+
+~~~
+
+contracts/
+ ├─ RecurPull.sol
+ └─ RecurPullSafeV2.sol
+docs/
+ ├─ RIP-001.md
+ ├─ RIP-002.md      # Authorization Registry & Events (optional index, draft)
+ ├─ AUDIT_SUMMARY.md
+ └─ CHANGELOG.md
+tests/
+ └─ README.md
+LICENSE
+README.md
+
+~~~
+
+---
+
+## Audit Summary (informal)
+-	✅ Domain separation (chainId + verifyingContract)  
+-	✅ ECDSA (EOA) + EIP-1271 (SCW) signature verification (SafeV2)  
+-	✅ Revocation (hash or grantor-bound)  
+-	✅ Cumulative cap (SafeV2)  
+-	✅ Reentrancy guard (SafeV2)  
+-	✅ Zero address & time-window checks  
+-	✅ permit() path (SafeV2) to avoid pre-approve UX  
+
+Recommended v1.1 improvements:
+-	Use SafeERC20 for non-standard tokens  
+-	Optional per-pull limit / rate-limit  
+-	Permit2 compatibility  
+
+→ Full notes in docs/AUDIT_SUMMARY.md.
+
+---
+
+## Specs & RIPs  
+	
+- RIP-001: Permissioned Pull Primitive (core standard)
+- RIP-002: Authorization Registry & Events (optional index layer, draft)
+
+Future RIPs: ERC-721 / 4626 adaptations, metered/streamed limits, cross-chain consent registries.
+
+---
+
+
+## Stewardship
+
+Maintained by **Recur Labs** as the canonical reference for RIP-001.
+Open for issues/PRs, implementation feedback, and audits.
+There is **no token** associated with this repo.
+
+Copyright © 2025 M J / Recur Labs. Licensed under Apache-2.0.
+
+
