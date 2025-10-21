@@ -12,5 +12,5 @@ The canonical reference repository for the Recur permissioned-pull standard — 
 Maintained by **Recur Labs**.
 Recur defines programmable liquidity; consented continuity for digital value.
 
-📄 Whitepaper: recurprotocol.com
-📘 Technical paper (coming Oct 28)
+ Whitepaper: recurprotocol.com
+ Technical paper (coming Oct 28)
