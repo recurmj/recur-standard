@@ -13,4 +13,5 @@ Maintained by **Recur Labs**.
 Recur defines programmable liquidity; consented continuity for digital value.
 
  Whitepaper: recurprotocol.com
+ 
  Technical paper (coming Oct 28)
