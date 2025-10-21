@@ -142,12 +142,29 @@ Future RIPs: ERC-721 / 4626 adaptations, metered/streamed limits, cross-chain co
 ---
 
 
+## Philosophy
+
+Recur encodes **freedom as structure:** replacing reactive control with consented continuity.
+Liquidity moves before failure; stability becomes emergent.
+
+---
+
 ## Stewardship
 
-Maintained by **Recur Labs** as the canonical reference for RIP-001.
-Open for issues/PRs, implementation feedback, and audits.
-There is **no token** associated with this repo.
+This repository is maintained by **Recur Labs** as the canonical reference for the permissioned-pull standard (RIP-001). 
+Recur Labs invites implementation feedback, formal audits, and ecosystem integrations.
+All text and code are © 2025 M J / Recur Labs under the Apache 2.0 License.
 
-Copyright © 2025 M J / Recur Labs. Licensed under Apache-2.0.
+There is **no token** associated with this repository.
+Recur is an open standard — not a financial instrument or investment project.
 
+---
+
+## Resources
+
+- Whitepaper: [Recur — The Flow Layer for Digital Value](https://recurprotocol.com/Recur_Whitepaper_v1.0_Oct2025.pdf)
+- Technical Paper: Releasing Octover 28, 2025
+- Website: recurprotocol.com
+- Labs Updates: @recurlabs (X/Twitter)
+- Founders: @recurmj (X/Twitter)
 
