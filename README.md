@@ -162,9 +162,12 @@ Recur is an open standard — not a financial instrument or investment project.
 
 ## Authorship & Attribution
 
-Recur (RIP-001) was first published by M J through Recur Labs in October 2025 as the original specification of permissioned-pull flow.
+Recur (RIP-001) — The Permissioned-Pull Standard for Digital Value —
+was first published by **M J (Recur Labs)** in October 2025 as the original specification introducing *consented continuity* and *permissioned-pull flow* for EVM-based assets.
 
-Any subsequent EIPs or derivatives should reference this repository as prior art.
+All text, architecture, and reference code are © 2025 Recur Labs.
+
+Any subsequent EIPs, ERCs, or derivative works referencing the permissioned-pull model or consented continuity should cite this repository as **prior art** and include attribution to *Recur Labs and M J* as the canonical source.
 
 ---
 
