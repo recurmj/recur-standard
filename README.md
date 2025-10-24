@@ -1,6 +1,14 @@
 # Recur — Permissioned Pull for Digital Value
 ### The open standard for consented continuity (RIP-001)
 
+Recur defines the permissioned-pull standard for consented continuity.
+
+- RIP-001: stable, reference-ready
+- RIP-002: draft (Consent Registry, event schema)
+- RIP-003: exploratory cross-network continuity  
+
+Expect iteration. This repo is the canonical source of truth.
+
 ## Quick Start (RIP-001 + RIP-002)
 
 Recur is a permissioned-pull standard.
