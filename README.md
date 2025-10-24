@@ -1,6 +1,44 @@
 # Recur — Permissioned Pull for Digital Value
 ### The open standard for consented continuity (RIP-001)
 
+## Quick Start (RIP-001 + RIP-002)
+
+Recur is a permissioned-pull standard.
+It lets value move under consent before failure; instead of reacting after.
+
+Core flow:
+
+1. The grantor (user / treasury / protocol) signs an Authorization off-chain:
+   - who can pull (grantee)
+   - which token
+   - how much per pull
+   - valid time window
+   - nonce
+
+2. The grantee calls `pull()` on `RecurPullSafeV2.sol`.
+   - The contract checks:
+     - it’s the right grantee
+     - we’re inside the time window
+     - the amount is within limits
+     - the Authorization signature is valid (stubbed here, audit-ready EIP-712 later)
+     - the consent has NOT been revoked in the Consent Registry
+
+3. Funds move directly from grantor → grantee using ERC-20 `transferFrom()`.
+   No custody, no pooled funds.
+
+4. The contract tells `RecurConsentRegistry.sol` to record the pull.
+   - The registry emits canonical RIP-002 events (`PullExecuted`, `AuthorizationRevoked`, etc.)
+   - Indexers / wallets / auditors can now track flows, totals, and revocations.
+
+5. At any point, the grantor can revoke by calling `revoke()` on the Consent Registry.
+   After that, any future `pull()` using that authHash will fail automatically.
+
+This is the first complete loop of consented continuity:
+- programmable pull,
+- global revocation,
+- standard events,
+- zero custody.
+
 **Recur** defines the first general-purpose *permissioned-pull* primitive for ERC-20 (and other EVM assets).  
 It lets value flow safely and continuously — **before failure, not after** — via explicit, revocable consent.
 
@@ -15,7 +53,7 @@ This repository is the **canonical reference** for **RIP-001**, including:
 - `contracts/RecurPull.sol` — minimal standard primitive
 - `contracts/RecurPullSafeV2.sol` — hardened template for pilots
 - `docs/RIP-001.md` — specification
-- `docs/RIP-002.md` — *Authorization Registry & Events* (optional index, draft)
+- `docs/RIP-002.md` — *Consent Registry & Events* (optional index, draft)
 - `docs/AUDIT_SUMMARY.md` — informal review notes
 - `tests/` — test scaffold notes
 
