@@ -139,6 +139,20 @@ Both implement the same **authorize → verify → pull → revoke** logic that 
 
 ---
 
+### Cross-Network Extensions
+
+RecurRelay.sol — [RIP-003 Draft]
+
+A minimal consent-status relay for cross-network liquidity coordination.
+
+It does **not** bridge, wrap, or custody assets.  
+Instead, it provides a portable proof surface for verifying whether a Permissioned Pull Object (PPO) remains active, revoked, or capped on its origin chain.  
+Destination-chain pull contracts may query this relay before executing a pull(), enabling *consented liquidity synchronization* across EVM networks.
+
+> This contract represents the first draft reference for RIP-003: Cross-Network Flow Messaging.
+
+---
+
 ## Folder Structure
 
 ~~~
