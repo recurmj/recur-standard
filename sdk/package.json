@@ -1,8 +1,8 @@
 {
-  "name": "@recur/sdk",
+  "name": "@recur/sdk-ref",
   "version": "0.1.0",
   "type": "module",
-  "main": "index.js",
+  "main": "ppo.js",
   "license": "Apache-2.0",
-  "description": "Minimal helpers for Recur RIP-001 (permissioned-pull)."
+  "description": "Reference helpers for Recur RIP-001 (Permissioned Pull Object). Not production code"
 }
