@@ -1,3 +1,4 @@
+// sdk/ppo.js
 // Minimal helpers for RIP-001 (Permissioned Pull Object / PPO)
 
 export function buildPPO({
@@ -6,8 +7,8 @@ export function buildPPO({
   token,
   receiver,     // where funds should land
   maxAmount,    // total authorized
-  validAfter,   // earliest usable timestamp
-  validBefore,  // latest usable timestamp
+  validAfter,   // earliest usable timestamp (unix seconds)
+  validBefore,  // latest usable timestamp (unix seconds)
   nonce,
 }) {
   return {
@@ -36,6 +37,8 @@ export const PPO_TYPES = {
 };
 
 // EIP-712 signing helper
+// signer: ethers.Signer that controls the grantor wallet
+// verifyingContract: address of RecurPullSafeV2 (or equivalent) on this chain
 export async function signPPO(signer, verifyingContract, ppo) {
   const chainId =
     (await signer.getChainId?.()) ??
@@ -49,5 +52,10 @@ export async function signPPO(signer, verifyingContract, ppo) {
   };
 
   const signature = await signer._signTypedData(domain, PPO_TYPES, ppo);
-  return signature;
+
+  // Return a "signedPPO" object ready for pull()
+  return {
+    ...ppo,
+    signature,
+  };
 }
