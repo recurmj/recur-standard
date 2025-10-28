@@ -12,21 +12,23 @@ pragma solidity ^0.8.20;
 /// - Channels are registered with a weight. The highest-weight active
 ///   channel is chosen greedily each step.
 ///
-/// Security model:
+/// SECURITY MODEL
 /// - FlowChannelHardened MUST enforce pause/revoke/policy. AdaptiveRouter assumes
 ///   pull() will revert if the channel is paused, revoked, rate-limited,
-///   out-of-policy, etc.
+///   or otherwise out-of-policy.
 /// - claimable(channelId) is treated as "currently safe to route". The router
 ///   trusts that value and does not re-check limits itself.
+/// - Router never escrows funds. Movement is always grantor -> `to`.
 ///
 /// This contract is intentionally thin. It's a coordinator, not a bank.
 interface IFlowChannelHardened {
     /// @notice Pull `amount` of already-accrued funds out of channel `id` to `to`.
-    /// @dev MUST revert internally if channel is paused, revoked, rate-limited, etc.
+    /// @dev MUST revert internally if channel is paused, revoked, over policy, etc.
     function pull(bytes32 id, address to, uint256 amount) external;
 
     /// @notice How much is currently claimable for channel `id`.
-    /// @dev MUST NOT over-report. Router trusts this number.
+    /// @dev MUST NOT over-report. Router trusts this number to be conservative and
+    ///      already reflect pause/revoke/policy state in FlowChannelHardened.
     function claimable(bytes32 id) external view returns (uint256);
 }
 
@@ -115,9 +117,12 @@ contract AdaptiveRouter {
     /// @param channelId Opaque channel identifier understood by FlowChannelHardened.
     /// @param weight Higher weight means this channel is preferred in routing.
     /// @dev Reverts if channel already exists.
-    function registerChannel(bytes32 channelId, uint256 weight) external onlyController {
+    function registerChannel(bytes32 channelId, uint256 weight)
+        external
+        onlyController
+    {
         require(channelId != bytes32(0), "BAD_ID");
-        require(targetFor[channelId].channelId == 0, "EXISTS");
+        require(targetFor[channelId].channelId == bytes32(0), "EXISTS");
 
         channelList.push(channelId);
 
@@ -138,7 +143,7 @@ contract AdaptiveRouter {
         external
         onlyController
     {
-        require(targetFor[channelId].channelId != 0, "NO_CHANNEL");
+        require(targetFor[channelId].channelId != bytes32(0), "NO_CHANNEL");
 
         targetFor[channelId].weight = weight;
         targetFor[channelId].active = active;
@@ -154,19 +159,34 @@ contract AdaptiveRouter {
     /// @param to The destination address that should receive funds. Must not be zero.
     /// @param maxDesired Upper bound of how much we want to move this step.
     /// @dev
-    /// Strategy:
-    /// - Pick the active channel with the highest weight.
-    /// - Ask that channel how much is currently claimable.
-    /// - Pull up to min(claimable, maxDesired).
+    /// GREEDY STRATEGY (INTENTIONAL):
+    /// - We scan all registered channels and pick the active one with the
+    ///   highest `weight`. That channel encodes treasury / compliance priority
+    ///   (e.g. "use regulated treasury first, then exchange hot wallet, then cold").
+    /// - We DO NOT try to split across multiple channels in a single call.
+    ///   That keeps routing deterministic, auditable, and easy to halt.
     ///
-    /// This is usually driven by SettlementMesh (RIP-008),
-    /// which repeatedly calls routeStep() to nudge the system toward
-    /// its target allocation across domains.
+    /// FLOW:
+    /// - Pick highest-weight active channel.
+    /// - Ask that channel how much is currently claimable() (which MUST already
+    ///   respect pause/revoke/policy in FlowChannelHardened).
+    /// - Pull up to min(claimable, maxDesired) from that single source.
     ///
-    /// Safety:
-    /// - Router never holds funds; FlowChannelHardened moves grantor -> `to`.
-    /// - We rely on FlowChannelHardened.pull() to revert if paused/revoked/out-of-policy.
-    function routeStep(address to, uint256 maxDesired) external onlyController {
+    /// GOVERNANCE LOOP:
+    /// - SettlementMesh (RIP-008) calls routeStep() repeatedly while updating
+    ///   weights / actives between calls. That higher layer is responsible for
+    ///   global allocation math and fairness across channels and destinations.
+    ///
+    /// SAFETY:
+    /// - Router never escrows funds; FlowChannelHardened moves grantor -> `to`.
+    /// - If FlowChannelHardened.pull() reverts (policy block, paused, etc.),
+    ///   this whole call reverts and no fallback channel is attempted. That
+    ///   "loud fail" is deliberate so governance sees the restriction signal
+    ///   instead of silently draining a lower-priority source.
+    function routeStep(address to, uint256 maxDesired)
+        external
+        onlyController
+    {
         require(to != address(0), "BAD_TO");
 
         // Pick highest-weight active channel.
@@ -184,7 +204,7 @@ contract AdaptiveRouter {
             }
         }
 
-        require(best != 0, "NO_ACTIVE_ROUTE");
+        require(best != bytes32(0), "NO_ACTIVE_ROUTE");
 
         // Ask that channel how much is currently safe to pull.
         uint256 c = flow.claimable(best);
@@ -195,9 +215,9 @@ contract AdaptiveRouter {
             amt = maxDesired;
         }
 
-        // Move funds directly from grantor (inside the channel) -> `to`.
-        // If amt == 0, pull() is skipped but we still emit Routed(...,0)
-        // so Mesh can audit "we tried to feed X; nothing available."
+        // Non-custodial move: channel pulls grantor -> `to`.
+        // If amt == 0, we skip pull() but still emit Routed(best, to, 0)
+        // so Mesh can audit "attempted rebalance; nothing available".
         if (amt > 0) {
             flow.pull(best, to, amt);
         }
