@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
+/// @dev controller is expected to be the same Safe/multisig that operates
+///      DomainDirectory, so that one ops key can halt routing end-to-end.
 /// @title SettlementMesh — RIP-008 hardened reference (final)
 /// @notice Self-balancing liquidity coordinator. Nudges allocations toward target
 ///         weights by telling AdaptiveRouter to route funds toward whichever
