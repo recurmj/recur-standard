@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
+/// @dev controller is expected to be the same Safe/multisig that operates
+///      DomainDirectory, so that one ops key can halt routing end-to-end.
 /// @title CrossNetworkRebalancer — RIP-004 reference executor
 /// @notice Non-custodial liquidity coordinator that executes verified FlowIntents (RIP-003)
 ///         across domains without bridges, wrappers, pooled custody, or this contract
