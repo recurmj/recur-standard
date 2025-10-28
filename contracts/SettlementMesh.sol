@@ -12,6 +12,9 @@ pragma solidity ^0.8.20;
 /// - Balances are reported, not discovered on-chain. Treasury / ops feeds
 ///   real-world numbers in via reportBalances().
 /// - Each call to rebalanceTick() is one incremental nudge, not a full solve.
+/// - We do NOT require that sum(targetBps) == 10000. You can intentionally
+///   over- or under-allocate. We just compare each destination to its own
+///   desired share of `reportedTotal`.
 ///
 /// Flow:
 ///   1. controller calls reportBalances(...).
@@ -20,7 +23,13 @@ pragma solidity ^0.8.20;
 ///      and asks AdaptiveRouter to push up to `maxStepAmount` toward it.
 ///   4. Router drains from the highest-weight eligible channel (RIP-006),
 ///      which in turn pays directly from grantor -> destination. No custody.
-
+/// 
+/// SECURITY / REENTRANCY NOTE:
+/// - rebalanceTick() makes an external call to router.routeStep(), which is
+///   expected to move real funds downstream. SettlementMesh does NOT update any
+///   of its own accounting after that external call (no post-state writes),
+///   so reentrancy back into Mesh can't corrupt internal state.
+/// - router MUST be trusted infra (AdaptiveRouter with its controller locked).
 interface IAdaptiveRouter {
     /// @notice Attempt to route up to `maxDesired` funds to `to`.
     /// @dev Router will:
@@ -36,7 +45,10 @@ contract SettlementMesh {
         bool active;      // if false, ignore this destination in balancing logic
     }
 
+    /// @notice Privileged authority (treasury Safe / multisig).
     address public controller;
+
+    /// @notice Router (RIP-006) that actually talks to FlowChannelHardened.
     IAdaptiveRouter public router;
 
     // List of destinations (chain treasuries, exchange hot wallets, custodians, etc.)
@@ -82,12 +94,15 @@ contract SettlementMesh {
     /// @param routerAddr address of AdaptiveRouter (RIP-006)
     /// @param initialController address of Safe / multisig governance
     constructor(address routerAddr, address initialController) {
+        require(routerAddr != address(0), "BAD_ROUTER");
+        require(initialController != address(0), "BAD_CTRL");
         router = IAdaptiveRouter(routerAddr);
         controller = initialController;
     }
 
     /// @notice Governance can rotate controller (e.g. rotate multisig).
     function setController(address newController) external onlyController {
+        require(newController != address(0), "BAD_CTRL");
         controller = newController;
         emit ControllerUpdated(newController);
     }
@@ -95,6 +110,7 @@ contract SettlementMesh {
     /// @notice Configure/adjust desired allocation for a given destination.
     /// @dev targetBps is the desired share of the *reportedTotal* for that dest.
     ///      Example: targetBps = 4500 means "we want ~45% of total liquidity here."
+    ///      We do NOT enforce that sum of all targetBps == 10000.
     /// @param dest destination address (treasury wallet, chain sink, etc.)
     /// @param targetBps basis points of desired share (0–10000)
     /// @param active whether this dest participates in balancing
@@ -103,6 +119,7 @@ contract SettlementMesh {
         uint32 targetBps,
         bool active
     ) external onlyController {
+        require(dest != address(0), "BAD_DEST");
         require(targetBps <= 10000, "BPS_GT_100%");
         if (!_isKnown(dest)) {
             destList.push(dest);
@@ -155,6 +172,12 @@ contract SettlementMesh {
     ///
     /// SettlementMesh never touches funds.
     ///
+    /// SECURITY / TRUST:
+    /// - This function makes an external call to `router.routeStep` which is
+    ///   expected to perform real fund movement down the line.
+    /// - Only `controller` can call this, so you are explicitly authorizing that
+    ///   movement when you call it.
+    ///
     /// @param maxStepAmount Upper bound we allow router to try to send this tick.
     function rebalanceTick(uint256 maxStepAmount) external onlyController {
         require(maxStepAmount > 0, "ZERO_STEP");
@@ -162,7 +185,7 @@ contract SettlementMesh {
         address bestDest;
         uint256 bestDeficit;
 
-        // Choose the destination that's most below target share
+        // Choose the destination that's most below target share.
         for (uint256 i = 0; i < destList.length; i++) {
             address d = destList[i];
             DestTarget memory tgt = desired[d];
@@ -172,7 +195,6 @@ contract SettlementMesh {
 
             // desired stake in absolute units
             uint256 want = (reportedTotal * uint256(tgt.targetBps)) / 10000;
-
             uint256 have = reportedBalance[d];
             if (have >= want) continue;
 
@@ -194,6 +216,7 @@ contract SettlementMesh {
         }
 
         // Instruct router to nudge liquidity toward the most underweight dest.
+        // router will internally pick a funding channel and perform the actual pull.
         router.routeStep(bestDest, step);
 
         emit MeshStep(bestDest, bestDeficit, step);
