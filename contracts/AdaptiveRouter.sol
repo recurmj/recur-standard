@@ -13,9 +13,10 @@ pragma solidity ^0.8.20;
 ///
 /// Security model:
 /// - The underlying FlowChannelHardened MUST enforce pause/revoke/policy.
-///   AdaptiveRouter assumes that `pull()` will revert if the channel is paused,
-///   revoked, or over policy.
-/// - `claimable(channelId)` is treated as "safe to route right now".
+///   AdaptiveRouter assumes that pull() will revert if the channel is paused,
+///   revoked, rate-limited, or otherwise out-of-policy.
+/// - claimable(channelId) is treated as "safe to route right now" and MUST NOT
+///   over-report. Router trusts that value.
 ///
 /// This contract is intentionally simple: it's a coordinator, not a bank.
 interface IFlowChannelHardened {
@@ -35,7 +36,7 @@ contract AdaptiveRouter {
 
     struct RouteTarget {
         bytes32 channelId; // logical channel handle used by FlowChannelHardened
-        uint256 weight;    // routing priority (higher = drain first)
+        uint256 weight;    // routing priority (higher = drain first / prefer this channel)
         bool active;       // if false, router ignores this channel
     }
 
@@ -59,8 +60,9 @@ contract AdaptiveRouter {
     event ChannelUpdated(bytes32 indexed channelId, uint256 weight, bool active);
 
     /// @notice Fired every time the router attempts to move liquidity from a
-    ///         channel into `to`. If `amount` is zero, nothing was pulled
-    ///         (e.g. claimable() was zero or below maxDesired).
+    ///         channel into `to`. If `amount` is zero, nothing was actually
+    ///         pulled (e.g. claimable() was zero or below maxDesired), but we
+    ///         still emit for telemetry / mesh accounting.
     event Routed(bytes32 indexed channelId, address to, uint256 amount);
 
     /// -----------------------------------------------------------------------
@@ -94,8 +96,8 @@ contract AdaptiveRouter {
     /// @dev Reverts if channel already exists.
     function registerChannel(bytes32 channelId, uint256 weight) external onlyOwner {
         require(targetFor[channelId].channelId == 0, "EXISTS");
-        channelList.push(channelId);
 
+        channelList.push(channelId);
         targetFor[channelId] = RouteTarget({
             channelId: channelId,
             weight: weight,
@@ -130,19 +132,20 @@ contract AdaptiveRouter {
     /// - Ask that channel how much is currently claimable.
     /// - Pull up to min(claimable, maxDesired).
     ///
-    /// It's expected SettlementMesh drives repeated calls to routeStep()
-    /// slowly nudging the system toward target distribution across domains.
+    /// It's expected SettlementMesh (RIP-008) or other governance logic
+    /// repeatedly calls routeStep() to slowly nudge the system toward a
+    /// target allocation across domains.
     ///
     /// Safety:
     /// - We rely on FlowChannelHardened.pull() to revert if the underlying
     ///   channel is paused, revoked, or out-of-policy. We do NOT re-check that here.
+    /// - Router itself never touches funds; transfer is grantor -> `to`.
     function routeStep(address to, uint256 maxDesired) external onlyOwner {
         require(to != address(0), "BAD_TO");
 
+        // Pick highest-weight active channel
         bytes32 best;
         uint256 bestW;
-
-        // pick highest-weight active channel
         for (uint256 i = 0; i < channelList.length; i++) {
             bytes32 cid = channelList[i];
             RouteTarget memory rt = targetFor[cid];
@@ -155,15 +158,17 @@ contract AdaptiveRouter {
 
         require(best != 0, "NO_ACTIVE_ROUTE");
 
-        uint256 c = flow.claimable(best); // how much that channel says is safe to pull
-        uint256 amt = c;
+        // How much that channel says is currently safe to pull
+        uint256 c = flow.claimable(best);
 
+        // Bound by caller's requested maxDesired
+        uint256 amt = c;
         if (amt > maxDesired) {
             amt = maxDesired;
         }
 
         if (amt > 0) {
-            // This moves funds directly from the grantor tracked inside the
+            // This should move funds directly from the grantor tracked inside the
             // FlowChannelHardened channel to `to`. Router never holds funds.
             flow.pull(best, to, amt);
         }
