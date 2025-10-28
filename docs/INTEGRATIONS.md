@@ -110,6 +110,8 @@ To build on Recur:
 
 SDKs and example dapps are maintained under `/examples`.
 
+Developers can test against the reference PPO SDK at /sdk/ppo.js and /sdk/registry.js (RIP-002-compatible).
+
 ---
 
 ## 5. Interoperability  
@@ -148,3 +150,5 @@ Recur Labs maintains the open specification and reference implementations under:
  [github.com/recurmj/recur-standard](https://github.com/recurmj/recur-standard)
 
 ---
+
+© 2025 Recur Labs — Released under CC BY 4.0.
