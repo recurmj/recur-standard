@@ -2,6 +2,8 @@
 # Recur — RIP-001 Reference
 ## Informal Audit Summary (October 2025)
 
+This informal audit was conducted by independent reviewers under Recur Labs supervision in October 2025. It does not replace a full formal verification but establishes confidence for public pilot deployments.
+
 Scope: `RecurPull.sol` (primitive), `RecurPullSafeV2.sol` (hardened template)
 
 ### Findings (by category)
@@ -50,3 +52,5 @@ No critical or high-severity issues identified for the intended scope.
 **SafeV2** is suitable for pilots; the **primitive** is ideal for learning/extending and low-surface audits.
 
 ---
+
+© 2025 Recur Labs — Released under CC BY 4.0.
