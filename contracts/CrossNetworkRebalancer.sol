@@ -9,49 +9,48 @@ pragma solidity ^0.8.20;
 /// High-level flow:
 ///   1. A FlowIntent (RIP-003) is signed off-chain by the grantor. It says:
 ///        "executor X may move up to maxTotal of token T from srcDomain → dstDomain
-///         before validBefore."
+///         between validAfter and validBefore."
 ///   2. Caller (executor or controller multisig) calls executeFlowIntent(...) here,
-///      providing that FlowIntent, its signature, the PPO authHash for source funds,
-///      and desired amount.
+///      providing:
+///        - that FlowIntent,
+///        - its signature,
+///        - the PPO/channel authHash authorizing source-side movement,
+///        - desired amount.
 ///   3. We enforce:
-///        - caller authority
-///        - executor approved in both src/dst domains
-///        - PPO (authHash) not revoked in ConsentRegistry (RIP-002)
-///   4. We then ask FlowIntentRegistry.verifyAndConsume(...) to:
-///        - verify the grantor's EIP-712 signature (EOA or 1271 wallet)
+///        - caller authority (executor OR controller)
+///        - executor approved in both src & dst domains
+///        - PPO/channel auth (authHash) not revoked in ConsentRegistry (RIP-002)
+///   4. We call FlowIntentRegistry.verifyAndConsume(...) to:
+///        - verify the grantor's EIP-712 signature (EOA or 1271 SCW)
 ///        - enforce validity window
-///        - enforce cumulative maxTotal and reserve this amount
+///        - enforce cumulative cap (maxTotal) and reserve this amount
 ///        - refuse if revoked
-///   5. If registry approves, we instruct a source adapter to pull funds
-///      directly from the grantor toward the destination receiver.
-///      No custody ever sits in this contract.
+///   5. If registry approves, we pull funds directly from grantor → dstReceiver
+///      using the source domain adapter. This contract never escrows funds.
 ///
-/// TRUST SURFACE / RESPONSIBILITIES:
-/// - FlowIntentRegistry: signature, cap, expiry, replay, revoke.
-/// - ConsentRegistry (RIP-002): underlying PPO / channel authHash is still live.
-/// - DomainDirectory: who is allowed to route in a given domain + where funds
-///   are supposed to land in the destination domain.
+/// TRUST SURFACE / RESPONSIBILITIES
+/// - FlowIntentRegistry: signature validity, cap, expiry, replay, revocation.
+/// - ConsentRegistry (RIP-002): underlying PPO / channel authHash must still be live.
+/// - DomainDirectory: which executors are allowed in each domain, and
+///   the canonical destination address for that domain.
 /// - Source adapter (IRecurPullLike): actually executes the pull under RIP-001 / RIP-005,
-///   enforcing per-call ceilings, timing windows, policy, pause/revoke, etc.
+///   enforcing per-call ceilings, timing windows, revocation, policy, etc.
 ///
-/// CONTROLLER:
-/// - `controller` is a governance / Safe address that can also drive balancing,
-///   batch calls, or emergency-stop routing even if the named executor isn't calling.
-
-/// @notice Minimal projection of the FlowIntent that FlowIntentRegistry expects.
-/// Must align 1:1 with FlowIntentRegistry.FlowIntent (RIP-003 core intent).
+/// CONTROLLER
+/// - `controller` (Safe / governance) can batch or emergency-drive rebalancing
+///   even if the named executor isn't the direct caller.
 interface IFlowIntentRegistry {
     struct FlowIntent {
-        address grantor;      // liquidity owner / treasury controller
-        address executor;     // authorized router/agent to act on this intent
-        bytes32 srcDomain;    // "from" domain (opaque ID, e.g. keccak256("base:treasury"))
-        bytes32 dstDomain;    // "to" domain
-        address token;        // ERC-20 being rebalanced
-        uint256 maxTotal;     // TOTAL allowed to move under this intent
-        uint256 validAfter;   // unix timestamp lower bound
-        uint256 validBefore;  // unix timestamp upper bound
-        bytes32 nonce;        // unique salt for replay isolation
-        bytes32 metadataHash; // optional off-chain policy/compliance ref
+        address grantor;
+        address executor;
+        bytes32 srcDomain;
+        bytes32 dstDomain;
+        address token;
+        uint256 maxTotal;
+        uint256 validAfter;
+        uint256 validBefore;
+        bytes32 nonce;
+        bytes32 metadataHash;
     }
 
     /// @notice Verify + consume budget from a FlowIntent.
@@ -71,14 +70,14 @@ interface IFlowIntentRegistry {
 
 /// @notice Consent Registry (RIP-002).
 /// Global source of truth for whether a PPO / channel authorization (authHash)
-/// is still live. If revoked here, nobody should be pulling against it.
+/// is still live.
 interface IRecurConsentRegistry {
     function isRevoked(bytes32 authHash) external view returns (bool);
 }
 
 /// @notice DomainDirectory:
-/// - which executors are allowed to act in a given domain
-/// - where funds should be delivered in that destination domain
+/// - Which executors are allowed to act in a given domain
+/// - Where funds should be delivered in that destination domain
 interface IDomainDirectory {
     function isApprovedExecutor(bytes32 domainId, address executor) external view returns (bool);
     function receiverOf(bytes32 domainId) external view returns (address);
@@ -101,7 +100,7 @@ interface IRecurPullLike {
 }
 
 /// @notice Full FlowIntent payload passed into executeFlowIntent().
-/// This adds:
+/// Includes:
 ///  - authHash: hash of the lower-level PPO / channel authorization that
 ///              actually lets the adapter pull funds from the grantor.
 ///  - signature: the grantor's EIP-712 signature for the FlowIntent (RIP-003).
@@ -149,6 +148,11 @@ contract CrossNetworkRebalancer {
         address domainDirectory,
         address initialController
     ) {
+        require(intentRegistry != address(0), "BAD_INTENT_REG");
+        require(consentRegistry != address(0), "BAD_CONSENT_REG");
+        require(domainDirectory != address(0), "BAD_DIRECTORY");
+        require(initialController != address(0), "BAD_CTRL");
+
         intents = IFlowIntentRegistry(intentRegistry);
         consent = IRecurConsentRegistry(consentRegistry);
         directory = IDomainDirectory(domainDirectory);
@@ -157,10 +161,11 @@ contract CrossNetworkRebalancer {
 
     /// @notice Governance can rotate controller (Safe / emergency authority).
     function setController(address next) external onlyController {
+        require(next != address(0), "BAD_CTRL");
         controller = next;
     }
 
-    /// @notice Execute part of a FlowIntent.
+    /// @notice Execute a portion of a FlowIntent.
     ///
     /// @param intentFull         The full FlowIntent payload (including authHash + signature).
     /// @param amount             How much to move in this step (> 0).
@@ -169,7 +174,7 @@ contract CrossNetworkRebalancer {
     ///
     /// Steps:
     ///   1. Check caller authority + domain approvals.
-    ///   2. Check PPO/channel authHash is still live (not revoked).
+    ///   2. Check PPO/channel authHash still live (not revoked).
     ///   3. Call FlowIntentRegistry.verifyAndConsume() to:
     ///        - verify grantor signature (EOA or 1271)
     ///        - enforce time window
@@ -190,11 +195,12 @@ contract CrossNetworkRebalancer {
         address sourcePullContract
     ) external returns (bool ok) {
         require(amount > 0, "ZERO_AMOUNT");
+        require(sourcePullContract != address(0), "BAD_SOURCE_ADAPTER");
 
         // ---------------------------------------------------------------------
         // 1. Caller authority + domain approval
         // ---------------------------------------------------------------------
-        // Either the named executor calls directly, or controller batches on their behalf.
+        // Either the named executor calls directly, OR controller batches on their behalf.
         require(
             msg.sender == intentFull.executor || msg.sender == controller,
             "NOT_AUTHORIZED_CALLER"
@@ -213,9 +219,8 @@ contract CrossNetworkRebalancer {
         // ---------------------------------------------------------------------
         // 2. Underlying PPO / channel authorization still live
         // ---------------------------------------------------------------------
-        // authHash is the RIP-001 / RIP-002 / RIP-005 identifier for the actual
-        // pull authority (Permissioned Pull Object or Flow Channel). If revoked,
-        // no movement should occur.
+        // authHash is the RIP-001 / RIP-002 / RIP-005 identifier for actual pull authority.
+        // If it's revoked, we bail out now.
         require(!consent.isRevoked(intentFull.authHash), "PPO_REVOKED");
 
         // ---------------------------------------------------------------------
