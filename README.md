@@ -234,7 +234,7 @@ Any subsequent EIPs, ERCs, or derivative works referencing the permissioned-pull
 ## Resources
 
 - Whitepaper: [Recur — The Flow Layer for Digital Value](https://recurprotocol.com/Recur_Whitepaper_v1.0_Oct2025.pdf)
-- Technical Paper: Releasing October 28, 2025
+- Technical Paper: [Recur — Defining the Permissioned-Pull Standard for Digital Value](https://recurprotocol.com/Recur_Technical_Paper_v1.0_Oct2025.pdf)
 - Website: recurprotocol.com
 - Labs Updates: @recurlabs (X/Twitter)
 - Founder: @recurmj (X/Twitter)
