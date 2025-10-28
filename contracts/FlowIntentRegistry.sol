@@ -1,61 +1,89 @@
-// SPDX-License-Identifier: Apache-2.0
+/// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
-/// @title FlowIntentRegistry — RIP-003 reference implementation
-/// @notice Registers, verifies, accounts, and revokes cross-domain FlowIntents.
+/// @title FlowIntentRegistry
+/// @notice RIP-003 registry. Verifies, accounts, and revokes cross-domain FlowIntents.
+/// @custom:version 1.0.0
+/// @custom:author Recur Labs
 ///
 /// A FlowIntent says:
-///   "Executor X is allowed to move up to maxAmount of token T
+///   "executor X is allowed to move up to maxTotal of token T
 ///    from srcDomain → dstDomain for me (grantor),
-///    between validAfter and validBefore."
+///    during [validAfter, validBefore]."
 ///
-/// High level:
-/// - The grantor signs the FlowIntent off-chain (EIP-712 style).
-/// - The executor (or a controller acting for them) asks the Rebalancer
-///   to execute `amount`.
-/// - The Rebalancer calls `verifyAndConsume()` here:
-///     - signature is checked (EOA or 1271 smart wallet)
-///     - time window enforced
-///     - cap enforced via movedSoFar[intentHash]
-///     - revocation enforced
-///     - movedSoFar is incremented
+/// Lifecycle
+/// ---------
+/// 1. The grantor signs a FlowIntent off-chain (EIP-712).
+/// 2. CrossNetworkRebalancer calls verifyAndConsume() here with:
+///       - the FlowIntent struct
+///       - the grantor's signature
+///       - amountToMove for this step
+///    We:
+///       - check signature (EOA or 1271 smart wallet)
+///       - check time window
+///       - check revocation
+///       - enforce cumulative cap (movedSoFar + amountToMove <= maxTotal)
+///       - bind revocation authority to the grantor
+///       - increment movedSoFar
 ///
-/// - The grantor can revoke a specific intentHash at any time. After that,
-///   verifyAndConsume() will fail for that intentHash.
+/// 3. If we didn't revert, CrossNetworkRebalancer is cleared to actually
+///    perform the domain-to-domain movement using permissioned pull.
+///    Funds STILL never touch this contract.
 ///
-/// SECURITY NOTES:
+/// 4. The grantor can revoke a specific intentHash at any time.
+///    After revoke, verifyAndConsume() will always revert for that intent.
+///
+/// Security model
+/// --------------
 /// - This registry never moves funds.
-/// - We bind each intentHash to its grantor on first successful verification.
-///   Only that address can revoke the intent.
-/// - We DO NOT attempt to route or pull here. That happens in CrossNetworkRebalancer (RIP-004).
+/// - We bind each intentHash to its grantor (ownerOfIntent) on first success,
+///   so only that wallet can revoke.
+/// - We do NOT route or pull funds here. That happens in RIP-004
+///   (CrossNetworkRebalancer + domain adapters).
 ///
-/// COMPATIBILITY:
-/// - CrossNetworkRebalancer should call verifyAndConsume() before actually
-///   calling an adapter / channel to move funds.
-/// - The registry then becomes the single source of truth for:
-///     - "is this intent valid? has it expired? how much is left?"
-///     - "who can revoke it?"
+/// Executor enforcement
+/// --------------------
+/// - We do NOT check that msg.sender == i.executor here. That is enforced
+///   in CrossNetworkRebalancer. This lets governance/controller batch actions
+///   while still obeying per-intent limits.
+///
+/// Replay safety
+/// -------------
+/// - The EIP-712 domain separator includes chainId and address(this),
+///   so signatures cannot replay across networks or cloned registries.
+/// - nonce inside the FlowIntent makes each intent unique.
 interface IEIP1271 {
     function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
 }
 
+/// @dev Local ECDSA helper with low-s enforcement (EIP-2 style).
 library ECDSARecover {
     function recover(bytes32 hash, bytes memory sig) internal pure returns (address) {
         require(sig.length == 65, "BAD_SIG_LEN");
+
         bytes32 r;
         bytes32 s;
         uint8 v;
-        // sig = r (32) || s (32) || v (1)
+
         assembly {
             r := mload(add(sig, 32))
             s := mload(add(sig, 64))
             v := byte(0, mload(add(sig, 96)))
         }
-        // Allow both 27/28 and 0/1 style v, normalize:
+
+        // normalize v
         if (v < 27) {
             v += 27;
         }
         require(v == 27 || v == 28, "BAD_V");
+
+        // reject malleable s (must be in lower half of curve order)
+        // secp256k1n/2:
+        require(
+            uint256(s)
+                <= 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0,
+            "BAD_S"
+        );
 
         address signer = ecrecover(hash, v, r, s);
         require(signer != address(0), "ZERO_SIGNER");
@@ -68,29 +96,28 @@ contract FlowIntentRegistry {
     /// Data types
     /// -----------------------------------------------------------------------
 
-    /// @notice RIP-003 FlowIntent.
-    /// @dev This struct is what the grantor actually signs off-chain.
-    ///      The executor later presents it (plus signature) to the Rebalancer.
+    /// @notice RIP-003 FlowIntent (what the grantor signs off-chain).
+    /// @dev CrossNetworkRebalancer passes this in along with the signature.
     struct FlowIntent {
         address grantor;      // liquidity owner / treasury controller
         address executor;     // authorized router/agent to act on this intent
-        bytes32 srcDomain;    // opaque "from" domain identifier (ex: keccak256("base:treasury"))
+        bytes32 srcDomain;    // opaque "from" domain identifier (e.g. keccak256("base:treasury"))
         bytes32 dstDomain;    // opaque "to" domain identifier
         address token;        // ERC-20 being rebalanced
-        uint256 maxAmount;    // TOTAL allowed to move under this intent
+        uint256 maxTotal;     // TOTAL allowed to move under this intent
         uint256 validAfter;   // unix timestamp lower bound
         uint256 validBefore;  // unix timestamp upper bound
         bytes32 nonce;        // unique salt for replay isolation
         bytes32 metadataHash; // optional off-chain policy/compliance ref
     }
 
-    // intentHash => total already moved
+    // intentHash => total already moved (cumulative)
     mapping(bytes32 => uint256) public movedSoFar;
 
     // intentHash => has it been revoked?
     mapping(bytes32 => bool)    public revoked;
 
-    // intentHash => who is allowed to revoke (the canonical grantor)
+    // intentHash => canonical grantor allowed to revoke
     mapping(bytes32 => address) public ownerOfIntent;
 
     /// @notice EIP-712 domain separator for FlowIntent signatures.
@@ -98,10 +125,10 @@ contract FlowIntentRegistry {
 
     /// @notice EIP-712 typehash for FlowIntent.
     /// keccak256(
-    ///   "FlowIntent(address grantor,address executor,bytes32 srcDomain,bytes32 dstDomain,address token,uint256 maxAmount,uint256 validAfter,uint256 validBefore,bytes32 nonce,bytes32 metadataHash)"
+    ///   "FlowIntent(address grantor,address executor,bytes32 srcDomain,bytes32 dstDomain,address token,uint256 maxTotal,uint256 validAfter,uint256 validBefore,bytes32 nonce,bytes32 metadataHash)"
     /// )
     bytes32 public constant INTENT_TYPEHASH =
-        0x4fda6d44e9a0ab9ee76ed2c350f05e1a3b2a838bfda843440f1d232631b8db52;
+        0xb97fc7db6c8eb50e554e0c1d571c8df7e30e08b6f7fb36efaeb53ba5f3a2b967;
 
     /// @notice Emitted whenever an intent is revoked by its grantor.
     event IntentRevoked(bytes32 indexed intentHash, address indexed grantor);
@@ -114,7 +141,8 @@ contract FlowIntentRegistry {
     /// @param version Human-readable version (e.g. "1")
     ///
     /// We bind the domain separator to `address(this)` + `block.chainid`
-    /// so signatures cannot be replayed across chains or different registries.
+    /// so signatures cannot be replayed across chains or across different
+    /// registry instances.
     constructor(string memory name, string memory version) {
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
@@ -143,7 +171,7 @@ contract FlowIntentRegistry {
                 i.srcDomain,
                 i.dstDomain,
                 i.token,
-                i.maxAmount,
+                i.maxTotal,
                 i.validAfter,
                 i.validBefore,
                 i.nonce,
@@ -155,7 +183,9 @@ contract FlowIntentRegistry {
     /// @notice Full EIP-712 digest = keccak256("\x19\x01", DOMAIN_SEPARATOR, structHash)
     function _digest(FlowIntent calldata i) internal view returns (bytes32) {
         bytes32 structHash = _hashIntent(i);
-        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        return keccak256(
+            abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash)
+        );
     }
 
     function _isContract(address a) internal view returns (bool) {
@@ -163,29 +193,25 @@ contract FlowIntentRegistry {
     }
 
     /// -----------------------------------------------------------------------
-    /// Core entrypoint (for CrossNetworkRebalancer)
+    /// Core entrypoint (called by CrossNetworkRebalancer)
     /// -----------------------------------------------------------------------
 
     /// @notice Validate a FlowIntent + signature, enforce cap/time, and atomically
     ///         reserve `amountToMove` against its budget.
     ///
-    /// @dev Call this *before* actually moving funds.
-    ///      If this returns intentHash without reverting, you are cleared to act.
+    /// @dev Call this *before* actually moving funds. If this returns intentHash
+    ///      without reverting, the caller is cleared to act.
     ///
-    /// SECURITY ENFORCEMENTS:
-    ///  - verifies time window [validAfter, validBefore]
-    ///  - verifies not revoked
-    ///  - verifies signature (EOA ECDSA or 1271 smart wallet)
-    ///  - enforces cumulative maxAmount via movedSoFar[intentHash]
-    ///  - binds ownerOfIntent[intentHash] to the grantor on first success
+    /// Enforces:
+    ///  - current time within [validAfter, validBefore]
+    ///  - not revoked
+    ///  - signature belongs to `i.grantor` (EOA or EIP-1271 smart wallet)
+    ///  - movedSoFar[intentHash] + amountToMove <= maxTotal
+    ///  - ownerOfIntent[intentHash] is bound to the grantor on first success
     ///
     /// NOTE:
-    ///  We do NOT check that msg.sender == i.executor here.
-    ///  That should be enforced in CrossNetworkRebalancer, because you might
-    ///  also allow a governance/controller address to batch execution.
-    ///
-    /// RETURNS:
-    ///  - intentHash (the canonical hash of this intent)
+    ///  We do NOT check `msg.sender == i.executor` here.
+    ///  CrossNetworkRebalancer enforces executor authorization and domain allowlists.
     function verifyAndConsume(
         FlowIntent calldata i,
         bytes calldata signature,
@@ -196,18 +222,17 @@ contract FlowIntentRegistry {
         require(block.timestamp <= i.validBefore, "EXPIRED");
 
         intentHash = _hashIntent(i);
-
-        require(!revoked[intentHash], "REVOKED_INTENT");
+        require(!revoked[intentHash], "REVOKED");
 
         // enforce cumulative cap
         uint256 newMoved = movedSoFar[intentHash] + amountToMove;
-        require(newMoved <= i.maxAmount, "CAP_EXCEEDED");
+        require(newMoved <= i.maxTotal, "CAP_EXCEEDED");
 
         // verify signature from grantor (EIP-712)
         bytes32 dig = _digest(i);
 
         if (_isContract(i.grantor)) {
-            // Smart contract wallet path (EIP-1271)
+            // smart contract wallet path (EIP-1271)
             bytes4 magic = IEIP1271(i.grantor).isValidSignature(dig, signature);
             require(magic == 0x1626ba7e, "BAD_1271_SIG");
         } else {
@@ -221,7 +246,7 @@ contract FlowIntentRegistry {
             ownerOfIntent[intentHash] = i.grantor;
         }
 
-        // Reserve consumption.
+        // Reserve consumption so future calls can't exceed maxTotal.
         movedSoFar[intentHash] = newMoved;
     }
 
@@ -230,8 +255,8 @@ contract FlowIntentRegistry {
     /// -----------------------------------------------------------------------
 
     /// @notice Revoke a FlowIntent permanently.
-    /// @dev Only the grantor (ownerOfIntent[intentHash]) can revoke.
-    ///      After revocation, verifyAndConsume() will revert for this hash.
+    /// @dev Only the bound grantor can revoke.
+    ///      After revocation, verifyAndConsume() will always revert for this hash.
     function revokeIntent(bytes32 intentHash) external {
         address owner = ownerOfIntent[intentHash];
         require(owner != address(0), "UNKNOWN_INTENT");
@@ -242,20 +267,20 @@ contract FlowIntentRegistry {
     }
 
     /// -----------------------------------------------------------------------
-    /// Views (for explorers, CrossNetworkRebalancer telemetry, dashboards)
+    /// Views (for explorers / telemetry / dashboards)
     /// -----------------------------------------------------------------------
 
-    /// @notice How much total value this intent has authorized so far.
+    /// @notice Cumulative amount already "consumed" under this intent.
     function consumed(bytes32 intentHash) external view returns (uint256) {
         return movedSoFar[intentHash];
     }
 
-    /// @notice Has this intent been revoked?
+    /// @notice Whether this intent has been fully revoked.
     function isRevoked(bytes32 intentHash) external view returns (bool) {
         return revoked[intentHash];
     }
 
-    /// @notice Who is allowed to revoke this intent?
+    /// @notice Which address currently holds revocation power for this intent.
     function ownerOf(bytes32 intentHash) external view returns (address) {
         return ownerOfIntent[intentHash];
     }
