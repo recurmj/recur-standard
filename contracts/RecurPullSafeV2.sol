@@ -1,5 +1,67 @@
-/// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
+
+/// @title RecurPullSafeV2
+/// @notice RIP-001 permissioned pull executor with RIP-002 registry integration,
+///         EIP-712 authorization, and EIP-1271 smart wallet support.
+/// @dev
+/// CORE IDEA
+/// ---------
+/// This is a non-custodial pull primitive:
+///   - The grantor signs an Authorization off-chain (EIP-712 domain-bound to
+///     this contract + this chain).
+///   - The grantee calls pull(auth, amount).
+///   - We verify:
+///        * Consent still live in the Consent Registry (RIP-002).
+///        * Time window is valid.
+///        * Per-call ceiling (maxPerPull) is not exceeded.
+///        * Signature really came from `auth.grantor` (EOA or 1271 wallet).
+///        * Caller is exactly `auth.grantee`.
+///   - We then transfer ERC20 tokens directly from grantor -> grantee
+///     via transferFrom(). This contract NEVER escrows funds.
+///   - We emit an event and call registry.recordPull() for audit/analytics
+///     and to bind `authHash -> grantor` so only that grantor can revoke later.
+///
+/// SECURITY PROPERTIES
+/// -------------------
+/// - Global kill switch: The grantor (and only the grantor, per the hardened
+///   RecurConsentRegistry model) can revoke the authHash in the registry. After
+///   that, isRevoked(authHash) returns true and pulls revert forever.
+/// - No custody: If the grantor doesn't like what's happening, they can instantly
+///   drop the ERC20 allowance they gave this contract, even without on-chain
+///   revocation.
+/// - Hard per-call ceiling: `amount <= auth.maxPerPull`.
+/// - Bounded validity window: [validAfter, validBefore].
+/// - Signature is domain-separated by chainId and this contract address. You
+///   can't replay the same signed Authorization on a fork / clone / other chain.
+///
+/// WHAT THIS CONTRACT DOES **NOT** DO
+/// ----------------------------------
+/// - No per-epoch / per-day budgets. (That's RIP-007 PolicyEnforcer and/or
+///   FlowChannelHardened rate control.)
+/// - No receiver allowlists. Funds always go to auth.grantee, and cannot be
+///   rerouted per-call.
+/// - No streaming accrual. It's strictly "pull if signed and still allowed".
+///
+/// INTEGRATION REQUIREMENTS
+/// ------------------------
+/// - The grantor MUST have approved this contract as a spender for `auth.token`:
+///       IERC20(auth.token).approve(address(this), <limit>);
+///   Otherwise `transferFrom()` will revert with TRANSFER_FAIL.
+/// - The Consent Registry passed to the constructor MUST be trusted infra.
+///   In production it should:
+///       * bind authHash -> grantor on first recordPull(),
+///       * restrict revoke() so only that grantor can revoke,
+///       * ideally restrict recordPull() to known executors (like this contract).
+///
+/// REENTRANCY NOTE
+/// ---------------
+/// - We make one external call to the ERC20 token (transferFrom),
+///   then one external call to the registry (recordPull()).
+/// - `recordPull()` in a hardened deployment should be a trusted registry that
+///   does not call back into this contract. With that assumption, a explicit
+///   reentrancy guard isn't strictly required here.
+/// - If you plug in an untrusted registry, you are doing it wrong.
 
 /// @notice Minimal ERC-20 interface for pull-based transfers.
 interface IERC20 {
@@ -8,6 +70,9 @@ interface IERC20 {
 
 /// @notice Light interface to the Consent Registry (RIP-002).
 /// The registry is the global source of truth for revocation and cumulative accounting.
+/// In hardened deployments:
+///  - recordPull() is only callable by trusted executors,
+///  - revoke() is only callable by the canonical grantor bound to that authHash.
 interface IRecurConsentRegistry {
     function isRevoked(bytes32 authHash) external view returns (bool);
 
@@ -21,87 +86,56 @@ interface IRecurConsentRegistry {
 }
 
 /// @notice Smart contract wallet signature validator (EIP-1271-style).
-/// If grantor is a contract, we call isValidSignature(hash, sig) and expect 0x1626ba7e.
+/// If grantor is a contract wallet, we call isValidSignature(hash, sig)
+/// and expect 0x1626ba7e.
 interface IEIP1271 {
     function isValidSignature(bytes32 _hash, bytes calldata _signature) external view returns (bytes4 magicValue);
 }
 
-/// @title RecurPullSafeV2
-/// @notice RIP-001 executor with registry integration (RIP-002), EIP-712 signatures,
-///         and EIP-1271 smart wallet support.
-/// @dev
-/// Flow:
-///   1. Grantor signs an Authorization off-chain (EIP-712).
-///   2. Grantee calls pull(auth, amount).
-///   3. Contract:
-///        - checks revocation via Consent Registry
-///        - enforces time window + per-call limit
-///        - verifies signature matches grantor (EOA or smart wallet)
-///        - transfers directly from grantor -> grantee (non-custodial)
-///        - records the pull in the Consent Registry
-///
-/// Security properties:
-///   - Grantor can revoke globally at any time via the registry.
-///   - Grantee cannot exceed maxPerPull in a single call.
-///   - Outside validAfter/validBefore is rejected.
-///   - Signature is bound to this specific contract + chainId via EIP-712 domain.
-///   - If the grantor is a smart contract wallet, we respect EIP-1271.
-///
-/// IMPORTANT MODEL NOTE:
-///   This contract enforces *per-call* ceilings (maxPerPull) and timing windows.
-///   It does NOT track cumulative spend or mark an Authorization as "used".
-///   The assumption is:
-///     - Repeated pulls are allowed until the grantor revokes in the registry,
-///       or higher-level policy (FlowChannel / PolicyEnforcer / Mesh) cuts it off,
-///       or allowance runs out.
-///   That is intentional. Global rate / budget enforcement lives in RIP-005/006/007.
-///
-/// IMPLEMENTATION NOTES:
-///   - Grantor MUST have given this contract allowance on auth.token
-///     (or you front-run a permit() flow externally).
-///   - IERC20 here is minimal; non-standard ERC-20s may require SafeERC20 wrappers
-///     in downstream forks.
-///   - `registryAddr` in the constructor MUST be a trusted Consent Registry
-///     deployment on this chain.
-///
-/// This contract is suitable to publish as "production reference" for RIP-001+RIP-002.
 contract RecurPullSafeV2 {
     /// -----------------------------------------------------------------------
     /// Authorization struct
     /// -----------------------------------------------------------------------
 
+    /// @notice Off-chain signed grant of consent.
+    /// @dev
+    /// - `grantee` is BOTH (1) who may call pull() and (2) who receives funds.
+    /// - There is no per-call override of receiver here. If you need to route
+    ///   to arbitrary receivers, use FlowChannelHardened instead.
     struct Authorization {
-        address grantor;      // wallet giving consent
-        address grantee;      // wallet/agent allowed to pull
+        address grantor;      // wallet giving consent / paying funds
+        address grantee;      // wallet/agent allowed to pull AND the receiver of funds
         address token;        // ERC-20 being pulled
-        uint256 maxPerPull;   // per-call ceiling
+        uint256 maxPerPull;   // hard ceiling for a single pull() call
         uint256 validAfter;   // earliest timestamp allowed
         uint256 validBefore;  // latest timestamp allowed
-        bytes32 nonce;        // unique salt (prevents collisions)
-        bytes   signature;    // grantor's signature over this auth scope
+        bytes32 nonce;        // unique salt (prevents collision / replay across grants)
+        bytes   signature;    // EIP-712 / 1271 signature by grantor over *this* scope
     }
 
     /// -----------------------------------------------------------------------
     /// Immutable storage
     /// -----------------------------------------------------------------------
 
+    /// @notice Consent / revocation / accounting registry for this domain (RIP-002).
     IRecurConsentRegistry public immutable registry;
 
-    // EIP-712 domain separator, precomputed once at deploy.
+    /// @notice EIP-712 domain separator, bound to this chain and this contract.
     bytes32 private immutable _DOMAIN_SEPARATOR;
 
-    // keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+    /// @dev keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
     bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
         keccak256(
             "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
         );
 
-    // keccak256("Authorization(address grantor,address grantee,address token,uint256 maxPerPull,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
+    /// @dev keccak256("Authorization(address grantor,address grantee,address token,uint256 maxPerPull,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
     bytes32 private constant _AUTH_TYPEHASH =
         keccak256(
             "Authorization(address grantor,address grantee,address token,uint256 maxPerPull,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
         );
 
+    /// @notice Emitted after a successful pull() and transferFrom().
     event PullExecutedDirect(
         bytes32 indexed authHash,
         address indexed token,
@@ -139,9 +173,13 @@ contract RecurPullSafeV2 {
         return _DOMAIN_SEPARATOR;
     }
 
-    /// @notice Compute canonical hash ID for this Authorization.
-    /// @dev This MUST match RIP-002 derivation so wallets/indexers align.
-    ///      Signature is intentionally excluded.
+    /// @notice Compute canonical authHash for this Authorization.
+    /// @dev
+    /// - Signature is excluded.
+    /// - This MUST line up with how the Consent Registry (RIP-002) identifies
+    ///   an Authorization so that:
+    ///     - registry.isRevoked(authHash) acts as the global kill switch
+    ///     - registry.recordPull() binds this authHash to the grantor
     function authHashOf(Authorization calldata auth) public pure returns (bytes32) {
         return keccak256(
             abi.encode(
@@ -161,57 +199,57 @@ contract RecurPullSafeV2 {
     /// -----------------------------------------------------------------------
 
     /// @notice Execute a permissioned pull under a signed Authorization.
-    /// @param auth   The signed Authorization struct.
+    /// @param auth   The signed Authorization struct (grant terms).
     /// @param amount Requested amount for this call.
+    ///
+    /// @dev Reverts if:
+    ///   - authHash is revoked in the Consent Registry,
+    ///   - msg.sender != auth.grantee,
+    ///   - block.timestamp outside [validAfter, validBefore],
+    ///   - amount > maxPerPull,
+    ///   - signature is not valid for `auth.grantor`,
+    ///   - transferFrom(grantor -> grantee) fails (eg no allowance).
+    ///
+    /// Side effects on success:
+    ///   - Direct non-custodial ERC20 transfer from grantor to grantee.
+    ///   - Emit PullExecutedDirect for indexers / auditors.
+    ///   - registry.recordPull(...) is called so:
+    ///        * totalPulled[authHash] is incremented,
+    ///        * ownerOfAuth[authHash] in the registry is set to `grantor`
+    ///          if this is the first ever pull (so only that grantor can
+    ///          revoke from then on).
     function pull(
         Authorization calldata auth,
         uint256 amount
     ) external {
-        // -------------------------------------------------------------------
-        // 1. Derive canonical hash for registry lookups / audit trail
-        // -------------------------------------------------------------------
+        // 1. Canonical hash for registry lookups / audit trail
         bytes32 authHash = authHashOf(auth);
 
-        // -------------------------------------------------------------------
-        // 2. Global revocation check (grantor can nuke authority at any time)
-        // -------------------------------------------------------------------
+        // 2. Global revocation check (grantor can nuke authority in registry)
         require(!registry.isRevoked(authHash), "REVOKED");
 
-        // -------------------------------------------------------------------
-        // 3. Caller must be the authorized grantee
-        // -------------------------------------------------------------------
+        // 3. Caller must be the authorized grantee AND receiver of funds
         require(msg.sender == auth.grantee, "NOT_AUTHORIZED");
 
-        // -------------------------------------------------------------------
         // 4. Enforce timing guarantees
-        // -------------------------------------------------------------------
         require(block.timestamp >= auth.validAfter, "TOO_SOON");
         require(block.timestamp <= auth.validBefore, "EXPIRED");
 
-        // -------------------------------------------------------------------
         // 5. Enforce per-call ceiling
-        // -------------------------------------------------------------------
         require(amount <= auth.maxPerPull, "LIMIT");
+        require(amount > 0, "AMOUNT_0");
 
-        // -------------------------------------------------------------------
         // 6. Verify the grantor actually signed this Authorization
-        // -------------------------------------------------------------------
-        require(
-            _verifyGrantorSig(auth, auth.signature),
-            "BAD_SIG"
-        );
+        require(_verifyGrantorSig(auth, auth.signature), "BAD_SIG");
 
-        // -------------------------------------------------------------------
-        // 7. Direct, non-custodial transfer from grantor -> grantee
-        // -------------------------------------------------------------------
+        // 7. Direct, non-custodial transfer grantor -> grantee
+        //    NOTE: This requires ERC20 allowance from grantor to this contract.
         require(
             IERC20(auth.token).transferFrom(auth.grantor, auth.grantee, amount),
             "TRANSFER_FAIL"
         );
 
-        // -------------------------------------------------------------------
-        // 8. Emit local event (useful for explorers / debugging)
-        // -------------------------------------------------------------------
+        // 8. Emit local event (useful for explorers / debugging / monitoring)
         emit PullExecutedDirect(
             authHash,
             auth.token,
@@ -220,9 +258,7 @@ contract RecurPullSafeV2 {
             amount
         );
 
-        // -------------------------------------------------------------------
-        // 9. Inform registry (RIP-002 accounting / audit trail)
-        // -------------------------------------------------------------------
+        // 9. Inform registry (RIP-002 accounting / audit trail / revoke binding)
         registry.recordPull(
             authHash,
             auth.token,
@@ -236,7 +272,7 @@ contract RecurPullSafeV2 {
     /// Internal: signature verification
     /// -----------------------------------------------------------------------
 
-    /// @dev Rebuild the EIP-712 struct hash for Authorization.
+    /// @dev Build structHash = keccak256(abi.encode(_AUTH_TYPEHASH, ...))
     function _hashAuthorizationStruct(
         Authorization calldata auth
     ) internal pure returns (bytes32) {
@@ -254,14 +290,14 @@ contract RecurPullSafeV2 {
         );
     }
 
-    /// @dev Build full EIP-712 digest = keccak256("\x19\x01", domainSeparator, structHash)
+    /// @dev EIP-712 digest = keccak256("\x19\x01", domainSeparator, structHash)
     function _eip712Digest(bytes32 structHash) internal view returns (bytes32) {
         return keccak256(
             abi.encodePacked("\x19\x01", _DOMAIN_SEPARATOR, structHash)
         );
     }
 
-    /// @dev Verify that `auth.grantor` signed `auth` under this contract's EIP-712 domain.
+    /// @dev Verify that `auth.grantor` signed `auth` under this contract's domain.
     /// Supports both EOAs (ECDSA) and smart contract wallets (EIP-1271).
     function _verifyGrantorSig(
         Authorization calldata auth,
@@ -273,13 +309,14 @@ contract RecurPullSafeV2 {
         // Smart contract wallet path (EIP-1271)
         if (auth.grantor.code.length != 0) {
             try IEIP1271(auth.grantor).isValidSignature(digest, signature) returns (bytes4 magicVal) {
-                return (magicVal == 0x1626ba7e); // bytes4(keccak256("isValidSignature(bytes32,bytes)"))
+                // bytes4(keccak256("isValidSignature(bytes32,bytes)")) == 0x1626ba7e
+                return (magicVal == 0x1626ba7e);
             } catch {
                 return false;
             }
         }
 
-        // EOA path (ECDSA)
+        // EOA path (ECDSA, low-s enforced)
         if (signature.length != 65) {
             return false;
         }
@@ -288,7 +325,7 @@ contract RecurPullSafeV2 {
         bytes32 s;
         uint8 v;
 
-        // copy signature bytes into memory first to satisfy auditors
+        // copy signature into memory first (auditors prefer no direct calldata load)
         bytes memory sig = signature;
         assembly {
             r := mload(add(sig, 32))
@@ -296,12 +333,15 @@ contract RecurPullSafeV2 {
             v := byte(0, mload(add(sig, 96)))
         }
 
-        // normalize v
+        // normalize v: allow {0,1} or {27,28}
         if (v < 27) {
             v += 27;
         }
+        if (v != 27 && v != 28) {
+            return false;
+        }
 
-        // reject malleable s (EIP-2 style)
+        // reject malleable s (EIP-2 style): s must be in lower half
         // secp256k1n/2:
         if (
             uint256(s)
