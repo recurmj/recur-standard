@@ -16,6 +16,8 @@ It defines an auditable, revocable, non-custodial flow layer for ERC-20 and othe
 - cross-domain routing without bridges or pooled custody,  
 - treasury-grade allocation.
 
+Reference bundle (IPFS CID): bafkreigvnilhcfwvn6y7ew2emzo5ofqy5epp7q7z7itk3cdtggoet6t5ra
+
 ### Added  
 - **RIP-001 / RIP-002 core path**
 
