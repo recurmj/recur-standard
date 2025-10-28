@@ -15,8 +15,8 @@ pragma solidity ^0.8.20;
 ///   => Grantor must approve this contract as spender on the token.
 /// - If paused or revoked, accrual stops and pull() reverts.
 /// - Reentrancy is guarded.
-/// - AdaptiveRouter (RIP-006) and SettlementMesh (RIP-008) can call pull() indirectly
-///   by being set as the grantee, or by being the `to` they route to, depending on deployment.
+/// - AdaptiveRouter (RIP-006) and SettlementMesh (RIP-008) can coordinate pulls by setting
+///   themselves as the grantee, or by acting as destinations depending on deployment.
 ///
 /// AUDIT-READY BEHAVIOR
 /// - Accrual math is deterministic: accrued += ratePerSecond * dt, then capped at maxBalance.
@@ -24,9 +24,10 @@ pragma solidity ^0.8.20;
 /// - `claimable()` simulates `_sync()` without mutating, for routing decisions.
 ///
 /// INTEGRATION EXPECTATION
-/// - For institutional treasuries, each Channel maps 1:1 to "stream X of token T from grantor to grantee".
+/// - For institutional treasuries, each Channel maps 1:1 to:
+///     "stream token T from grantor → grantee at rate R, buffer-capped at B".
 /// - AdaptiveRouter picks *which* channel to drain and *where* to send it (the `to` param).
-/// - PolicyEnforcer (if present) can enforce jurisdiction, per-epoch limits, etc.
+/// - PolicyEnforcer (if present) can enforce jurisdiction allowlists, per-epoch ceilings, etc.
 interface ITrackedERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
@@ -36,7 +37,7 @@ interface IPolicyEnforcer {
     /// @dev Typical checks:
     ///  - caller is approved
     ///  - `to` is on an allowlist
-    ///  - amount is within per-epoch / per-day budget
+    ///  - amount fits per-epoch / per-day budget
     ///  - consume against running budget
     function checkAndConsume(
         bytes32 policyId,
@@ -46,8 +47,8 @@ interface IPolicyEnforcer {
     ) external;
 }
 
-/// @dev Simple reentrancy guard dedicated to FlowChannelHardened.
-/// We do NOT import OpenZeppelin here to keep the reference lean.
+/// @dev Minimal in-contract reentrancy guard.
+/// We keep this local (not OZ import) to make the reference maximally portable.
 abstract contract ReentrancyGuardFC {
     uint256 private _status = 1;
     modifier nonReentrant() {
@@ -81,9 +82,9 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     /// @notice channelId (bytes32) → Channel
     mapping(bytes32 => Channel) public channels;
 
-    /// -----------------------------------------------------------------------
-    /// Events
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Events
+    // -----------------------------------------------------------------------
 
     event ChannelOpened(
         bytes32 indexed id,
@@ -94,8 +95,16 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         uint256 maxBalance
     );
 
+    /// @notice Emitted when streaming parameters are updated.
+    /// @param id Channel ID.
+    /// @param oldRatePerSecond Previous accrual rate.
+    /// @param oldMaxBalance    Previous buffer cap.
+    /// @param newRatePerSecond New accrual rate.
+    /// @param newMaxBalance    New buffer cap.
     event ChannelRateUpdated(
         bytes32 indexed id,
+        uint256 oldRatePerSecond,
+        uint256 oldMaxBalance,
         uint256 newRatePerSecond,
         uint256 newMaxBalance
     );
@@ -108,9 +117,9 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     /// @dev `to` is the final receiver of funds in this pull().
     event Pulled(bytes32 indexed id, address to, uint256 amount);
 
-    /// -----------------------------------------------------------------------
-    /// Modifiers
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Modifiers
+    // -----------------------------------------------------------------------
 
     modifier onlyGrantor(bytes32 id) {
         require(msg.sender == channels[id].grantor, "NOT_GRANTOR");
@@ -122,25 +131,25 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         _;
     }
 
-    /// -----------------------------------------------------------------------
-    /// Channel lifecycle
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Channel lifecycle
+    // -----------------------------------------------------------------------
 
     /// @notice Create a new streaming channel.
-    /// @param id            Chosen channel identifier (must be unique).
-    /// @param grantee       Address allowed to call pull() / spend the stream.
-    /// @param token         ERC-20 being streamed.
-    /// @param ratePerSecond Tokens per second that accrue.
-    /// @param maxBalance    Maximum unclaimed buffer before accrual stops.
-    /// @param policyEnforcer Contract to enforce policy (optional, can be address(0)).
-    /// @param policyId      Policy identifier understood by policyEnforcer.
+    /// @param id              Chosen channel identifier (must be unique).
+    /// @param grantee         Address allowed to call pull() / spend the stream.
+    /// @param token           ERC-20 being streamed.
+    /// @param ratePerSecond   Tokens per second that accrue.
+    /// @param maxBalance      Maximum unclaimed buffer before accrual caps.
+    /// @param policyEnforcer  Optional policy module (address(0) = none).
+    /// @param policyId        Policy identifier for that enforcer.
     ///
     /// Requirements:
     /// - `id` must not already exist.
     /// - `ratePerSecond` > 0 and `maxBalance` > 0.
     /// - `grantee` and `token` must be nonzero.
-    /// - Grantor MUST separately approve this contract as ERC20 spender
-    ///   or nothing can ever actually transfer.
+    /// - Grantor MUST separately `approve()` this contract as ERC20 spender
+    ///   or nothing can actually transfer.
     function openChannel(
         bytes32 id,
         address grantee,
@@ -172,9 +181,9 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         emit ChannelOpened(id, msg.sender, grantee, token, ratePerSecond, maxBalance);
     }
 
-    /// -----------------------------------------------------------------------
-    /// Internal accrual logic
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Internal accrual logic
+    // -----------------------------------------------------------------------
 
     /// @dev Sync a channel's `accrued` balance up to `block.timestamp`.
     ///      Accrual stops if paused or revoked.
@@ -208,9 +217,9 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         _sync(id);
     }
 
-    /// -----------------------------------------------------------------------
-    /// Pull / spend path
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Pull / spend path
+    // -----------------------------------------------------------------------
 
     /// @notice Grantee withdraws part of the accrued balance to any `to`.
     /// @param id     Channel identifier.
@@ -220,15 +229,17 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     /// Requirements:
     /// - Caller MUST be the channel's grantee.
     /// - Channel MUST NOT be paused or revoked.
-    /// - `amount` ≤ claimable() at the time of call.
+    /// - `amount` > 0 and `amount` ≤ claimable() at this instant.
     /// - `to` cannot be address(0).
     ///
     /// On success:
     /// - `accrued` is reduced.
     /// - Token is transferred via ERC20.transferFrom(grantor -> to).
-    /// - PolicyEnforcer (if set) can veto or burn budget first.
+    /// - PolicyEnforcer (if set) can veto or meter this spend first.
     ///
-    /// SECURITY: This contract never takes custody.
+    /// SECURITY:
+    /// - This contract never takes custody — funds flow grantor → `to` directly.
+    /// - Grantor controls allowance. If allowance is yanked, pull() will just fail.
     function pull(bytes32 id, address to, uint256 amount)
         external
         nonReentrant
@@ -255,7 +266,7 @@ contract FlowChannelHardened is ReentrancyGuardFC {
             );
         }
 
-        // Deduct before external call
+        // Deduct BEFORE external call
         c.accrued -= amount;
 
         // Non-custodial transfer
@@ -267,9 +278,9 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         emit Pulled(id, to, amount);
     }
 
-    /// -----------------------------------------------------------------------
-    /// Grantor controls
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Grantor controls
+    // -----------------------------------------------------------------------
 
     /// @notice Pause accrual + block pulls (but do not revoke permanently).
     /// @dev We _sync first so `accrued` reflects balance up to this pause boundary.
@@ -294,8 +305,8 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     /// @dev After revoke():
     ///  - accrual is frozen forever
     ///  - pull() will revert
-    ///  - any remaining `accrued` is effectively stranded unless you build a recovery path
-    ///    (deliberately conservative: grantor is cutting the cord)
+    ///  - any remaining `accrued` is effectively stranded unless you add a custom unwind path
+    ///    (this is deliberate: revoke() is a hard kill switch)
     function revoke(bytes32 id) external onlyGrantor(id) {
         Channel storage c = channels[id];
         c.revoked = true;
@@ -316,19 +327,29 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         _sync(id);
 
         Channel storage c = channels[id];
-        c.ratePerSecond = newRatePerSecond;
-        c.maxBalance = newMaxBalance;
 
-        emit ChannelRateUpdated(id, newRatePerSecond, newMaxBalance);
+        uint256 oldRate = c.ratePerSecond;
+        uint256 oldCap  = c.maxBalance;
+
+        c.ratePerSecond = newRatePerSecond;
+        c.maxBalance    = newMaxBalance;
+
+        emit ChannelRateUpdated(
+            id,
+            oldRate,
+            oldCap,
+            newRatePerSecond,
+            newMaxBalance
+        );
     }
 
-    /// -----------------------------------------------------------------------
-    /// Views
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Views
+    // -----------------------------------------------------------------------
 
     /// @notice Pure view of how much is currently claimable, *as if* we synced now,
     ///         without mutating state.
-    /// @dev AdaptiveRouter / dashboards call this.
+    /// @dev Routers / dashboards / Mesh call this.
     function claimable(bytes32 id) external view returns (uint256) {
         Channel storage c = channels[id];
 
