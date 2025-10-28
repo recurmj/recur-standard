@@ -2,7 +2,7 @@
   "name": "@recur/sdk-ref",
   "version": "0.1.0",
   "type": "module",
-  "main": "ppo.js",
+  "main": "index.js",
   "license": "Apache-2.0",
-  "description": "Reference helpers for Recur RIP-001 (Permissioned Pull Object). Not production code"
+  "description": "Minimal helpers for Recur permissioned-pull (RIP-001), registry (RIP-002), and flow intents (RIP-003+)."
 }
