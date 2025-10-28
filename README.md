@@ -2,7 +2,7 @@
 
 ## The open standard for consented continuity (RIP-001 → RIP-008)
 
-Recur defines the permissioned-pull standard for safe, programmable movement of value across accounts, contracts, domains, and venues; without custodial bridges or “just trust ops” spreadsheets.
+Recur defines the permissioned-pull standard for safe, programmable movement of value across accounts, contracts, domains, and venues without custodial bridges or “just trust ops” spreadsheets.
 
 This repo ships audited-style reference contracts and SDK helpers for:
 
