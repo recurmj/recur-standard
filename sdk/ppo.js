@@ -1,22 +1,21 @@
 // sdk/ppo.js
 // Minimal helpers for RIP-001 (Permissioned Pull Object / PPO)
+// This produces the exact struct that RecurPullSafeV2 expects on-chain.
 
 export function buildPPO({
   grantor,
   grantee,
   token,
-  receiver,     // where funds should land
-  maxAmount,    // total authorized
-  validAfter,   // earliest usable timestamp (unix seconds)
-  validBefore,  // latest usable timestamp (unix seconds)
-  nonce,
+  maxPerPull,    // max allowed per pull() call
+  validAfter,    // earliest usable timestamp (unix seconds)
+  validBefore,   // latest usable timestamp (unix seconds)
+  nonce,         // unique salt to prevent replay collisions
 }) {
   return {
     grantor,
     grantee,
     token,
-    receiver,
-    maxAmount,
+    maxPerPull,
     validAfter,
     validBefore,
     nonce,
@@ -28,17 +27,16 @@ export const PPO_TYPES = {
     { name: "grantor",     type: "address" },
     { name: "grantee",     type: "address" },
     { name: "token",       type: "address" },
-    { name: "receiver",    type: "address" },
-    { name: "maxAmount",   type: "uint256" },
+    { name: "maxPerPull",  type: "uint256" },
     { name: "validAfter",  type: "uint256" },
     { name: "validBefore", type: "uint256" },
     { name: "nonce",       type: "uint256" },
   ],
 };
 
-// EIP-712 signing helper
+// EIP-712 signing helper.
 // signer: ethers.Signer that controls the grantor wallet
-// verifyingContract: address of RecurPullSafeV2 (or equivalent) on this chain
+// verifyingContract: address of the deployed RecurPullSafeV2 on this chain
 export async function signPPO(signer, verifyingContract, ppo) {
   const chainId =
     (await signer.getChainId?.()) ??
@@ -53,7 +51,11 @@ export async function signPPO(signer, verifyingContract, ppo) {
 
   const signature = await signer._signTypedData(domain, PPO_TYPES, ppo);
 
-  // Return a "signedPPO" object ready for pull()
+  // Return a "signedPPO" object ready to submit to pull()
+  // RecurPullSafeV2.pull() will:
+  //   - recompute this struct hash
+  //   - verify this signature matches ppo.grantor
+  //   - enforce timing + per-call cap + revocation
   return {
     ...ppo,
     signature,
