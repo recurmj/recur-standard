@@ -1,206 +1,197 @@
 # Recur — Permissioned Pull for Digital Value
-### The open standard for consented continuity (RIP-001)
 
-Recur defines the permissioned-pull standard for consented continuity.
+## The open standard for consented continuity (RIP-001 → RIP-008)
 
-- RIP-001: stable, reference-ready
-- RIP-002: draft (Consent Registry, event schema)
-- RIP-003: exploratory cross-network continuity  
+Recur defines the permissioned-pull standard for safe, programmable movement of value across accounts, contracts, domains, and venues — without custodial bridges or “just trust ops” spreadsheets.
 
-Expect iteration. This repo is the canonical source of truth.
+This repo ships audited-style reference contracts and SDK helpers for:
 
-## Quick Start (RIP-001 + RIP-002)
+- **RIP-001**: Permissioned Pull primitive (per-call consent)
+- **RIP-002**: Consent Registry (revocation + global audit log)
+- **RIP-003**: FlowIntents (cross-domain signed liquidity rights)
+- **RIP-004**: CrossNetworkRebalancer (domain-to-domain routing under signed intent)
+- **RIP-005**: FlowChannelHardened (continuous streaming channel with rate limit, pause, revoke)
+- **RIP-006**: AdaptiveRouter + UniversalClock (routing + shared epoch slicing)
+- **RIP-007**: PolicyEnforcer (per-epoch spend ceilings / allowlists)
+- **RIP-008**: SettlementMesh (treasury-level allocator / balancer)
 
-Recur is a permissioned-pull standard.
-It lets value move under consent before failure; instead of reacting after.
-
-Core flow:
-
-1. The grantor (user / treasury / protocol) signs an Authorization off-chain:
-   - who can pull (grantee)
-   - which token
-   - how much per pull
-   - valid time window
-   - nonce
-
-2. The grantee calls `pull()` on `RecurPullSafeV2.sol`.
-   - The contract checks:
-     - it’s the right grantee
-     - we’re inside the time window
-     - the amount is within limits
-     - the Authorization signature is valid (stubbed here, audit-ready EIP-712 later)
-     - the consent has NOT been revoked in the Consent Registry
-
-3. Funds move directly from grantor → grantee using ERC-20 `transferFrom()`.
-   No custody, no pooled funds.
-
-4. The contract tells `RecurConsentRegistry.sol` to record the pull.
-   - The registry emits canonical RIP-002 events (`PullExecuted`, `AuthorizationRevoked`, etc.)
-   - Indexers / wallets / auditors can now track flows, totals, and revocations.
-
-5. At any point, the grantor can revoke by calling `revoke()` on the Consent Registry.
-   After that, any future `pull()` using that authHash will fail automatically.
-
-This is the first complete loop of consented continuity:
-- programmable pull,
-- global revocation,
-- standard events,
-- zero custody.
-
-**Recur** defines the first general-purpose *permissioned-pull* primitive for ERC-20 (and other EVM assets).  
-It lets value flow safely and continuously — **before failure, not after** — via explicit, revocable consent.
+**Status:**
+- RIP-001 → RIP-008: reference complete
+- Ready to freeze for first production pilot
+- Licensed under **Apache-2.0**
+- No token, no governance coin, no protocols to ape
 
 ---
 
-## Overview
+## Why Recur exists
 
-Push-based payments react after imbalance. That delay creates volatility and operational risk.  
-Recur introduces **pull within consent**: the grantor signs an EIP-712 authorization, the grantee can pull within limits, and the grantor can revoke instantly. Consent becomes structure.
+Push-based finance reacts after something is wrong. You notice imbalance (too much on exchange, not enough on L2, OTC desk dry), then you scramble.
 
-This repository is the **canonical reference** for **RIP-001**, including:
-- `contracts/RecurPull.sol` — minimal standard primitive
-- `contracts/RecurPullSafeV2.sol` — hardened template for pilots
-- `docs/RIP-001.md` — specification
-- `docs/RIP-002.md` — *Consent Registry & Events* (optional index, draft)
-- `docs/AUDIT_SUMMARY.md` — informal review notes
-- `tests/` — test scaffold notes
+Recur inverts that.  
+Instead of reacting *after* risk, you pre-authorize *safe pulls* under hard conditions:
 
-License: **Apache-2.0**. No token. Open standard.
+- who can pull
+- which asset
+- how much per call / per epoch
+- where it can go
+- when it expires
+- ability to nuke it instantly
+
+You get:
+- automated liquidity routing without pooled custody
+- programmable limits instead of “please don’t rug me”
+- fully on-chain, machine-readable consent and revocation
+- auditable global flow history
+
+This is “consented continuity.”
 
 ---
 
-## ⚙️ Quick Start
+## High-level architecture
 
-### 1) Install & build (Foundry or Hardhat)
-```bash
-forge build
-```
-or with hardhat: 
+### RIP-001: Permissioned Pull
 
-``` bash
-npm i && npx hardhat compile
-```
+Grantor signs a structured EIP-712 Authorization off-chain.  
+Grantee can pull within that Authorization.  
+Transfer is **direct grantor → grantee via `transferFrom()`**.  
+No custody in the executor contract.
 
-### 2) Import the primitive (or the safe template)
+Rules enforced at pull() time:
+- caller must be the authorized grantee
+- within time window
+- amount ≤ `maxPerPull`
+- signature must match grantor (EOA or 1271)
+- Authorization not revoked
 
-~~~
+### RIP-002: Consent Registry
 
-import "./contracts/RecurPull.sol";          // minimal primitive (standard)
-import "./contracts/RecurPullSafeV2.sol";    // recommended for pilots
+Global ledger for each Authorization (`authHash`):
+- who owns it (the grantor)
+- has it been revoked?
+- how much total has been pulled so far?
+- optional declared “soft cap” for dashboards
 
-~~~
+Every successful pull calls `recordPull()` and the registry emits canonical events:
+- `PullExecuted`
+- `AuthorizationRevoked`
+- `AuthorizationBudgetUpdated`
 
-### 3) Grantor signs an Authorization (EIP-712)
+Explorers and auditors only have to watch this one registry.
 
-~~~
+### RIP-003 / RIP-004: Cross-domain liquidity
 
-Authorization {
-  grantor:    0xSender,
-  grantee:    0xReceiver,   // must be msg.sender in pull()
-  token:      0xToken,
-  maxAmount:  1000e18,      // total cap (SafeV2) or per-call (primitive)
+Now zoom out.
+
+You don’t just want “Alice can pull 100 USDC per call.”  
+You want “Move 5m USDC from domain A to domain B under policy, without bridges or internal chaos.”
+
+That’s a **FlowIntent**.
+
+- Grantor signs:  
+  “Executor X can migrate up to `maxTotal` of token T from `srcDomain` to `dstDomain` between `validAfter` and `validBefore`.”
+
+- The **FlowIntentRegistry** (RIP-003) verifies the signature, enforces time window, enforces total cap, and tracks how much has already been consumed.
+
+- The **CrossNetworkRebalancer** (RIP-004) executes a piece of that intent:
+  - checks that the executor is approved in both domains,
+  - checks that the underlying per-channel consent (authHash) is still live (not revoked in the Consent Registry),
+  - asks the registry to `verifyAndConsume()` the intent budget,
+  - calls a domain adapter to actually move real tokens directly from the grantor to the canonical treasury receiver of the destination domain.
+
+No bridge, no wrapper token, no pooled “vault”.  
+It’s just orchestrated `transferFrom()` under layered, revokeable consent.
+
+### RIP-005 / RIP-006 / RIP-007 / RIP-008: Treasury-grade flow control
+
+At treasury scale, you rarely move one big chunk. You continuously rebalance across multiple venues, desks, chains, custodians.
+
+You need:
+- streaming channels (rate-limited drip instead of giant one-offs),
+- per-epoch spend ceilings,
+- who’s allowed to receive,
+- “route funds here because this venue is underweight,”
+- a single multisig / Safe that can turn the whole thing off if panicking.
+
+That’s the rest of the stack.
+
+---
+
+## Contracts shipped in this repo
+
+| Contract | RIP | Role | Custodies funds? |
+|-----------|-----|------|------------------|
+| `RecurPullSafeV2.sol` | 001/002 | Execute per-call pulls under a signed Authorization. Enforces window, maxPerPull, signature, revocation. | No |
+| `RecurConsentRegistry.sol` | 002 | Canonical revocation + accounting for each Authorization (`authHash`). Emits audit events. | No |
+| `FlowIntentRegistry.sol` | 003 | Verifies FlowIntents (cross-domain rights): checks signature, enforces total cap, tracks consumption, supports revoke. | No |
+| `CrossNetworkRebalancer.sol` | 004 | Uses a FlowIntent to actually route value from srcDomain → dstDomain via domain adapters, under DomainDirectory policy. | No |
+| `DomainDirectory.sol` | 004/008 | Governance map of domains → approved executors, canonical receiver addresses, adapter metadata, active/paused flag. | No |
+| `FlowChannelHardened.sol` | 005 | Streaming payment channel with pause, revoke, rate limit, accrued buffer. Calls PolicyEnforcer before every pull. | No |
+| `AdaptiveRouter.sol` | 006 | Chooses which active channel to drain and calls its `pull()` into a destination. | No |
+| `UniversalClock.sol` | 006 | Canonical epoch index for this deployment (e.g. 3600s epochs). PolicyEnforcer trusts this clock. | No |
+| `PolicyEnforcer.sol` | 007 | Enforces per-epoch spend ceilings, per-call ceilings, and receiver allowlists using UniversalClock epochs. | No |
+| `SettlementMesh.sol` | 008 | Treasury-level allocator. Figures out which destination is most underweight and tells AdaptiveRouter to feed it. | No |
+
+---
+
+## SDK helpers (JavaScript / ethers)
+
+We ship a tiny `sdk/` directory (ESM) to make signing and submitting flows easier.
+
+### `ppo.js` — build and sign a Permissioned Pull Object
+
+~~~js
+import { buildPPO, signPPO } from "./sdk/ppo.js";
+
+const ppo = buildPPO({
+  grantor: "0xGrantor",
+  grantee: "0xGrantee",
+  token: "0xUSDC",
+  maxPerPull: "1000000",
   validAfter: 1720000000,
-  validBefore:1730000000,
-  nonce:      keccak256("unique")
-}
+  validBefore: 1730000000,
+  nonce: "0xuniqueSalt"
+});
 
+const signedPPO = await signPPO(grantorSigner, recurPullSafeV2Addr, ppo);
+
+await recurPullSafeV2.connect(granteeSigner).pull(signedPPO, "500000");
 ~~~
 
-### 4) Grantee pulls within consent
+### `registry.js` — talk to the Consent Registry
 
+~~~js
+import { isRevoked, pulledTotal, capOf, revoke } from "./sdk/registry.js";
+
+const dead = await isRevoked(registryContract, authHash);
+const used = await pulledTotal(registryContract, authHash);
+const cap = await capOf(registryContract, authHash);
+
+await revoke(registryContract, authHash, { from: grantorSigner.address });
 ~~~
 
-pull(auth, amount, signature);          // requires allowance
-pullWithPermit(auth, amount, sig, data);// for ERC-2612 tokens (SafeV2)
+### `flowIntent.js` — build and sign a FlowIntent for cross-domain moves
 
-~~~
+~~~js
+import { buildFlowIntent, signFlowIntent } from "./sdk/flowIntent.js";
 
-### 5) Grantor can revoke at any time
+const flowIntent = buildFlowIntent({
+  grantor: "0xTreasurySafe",
+  executor: "0xRouterOrOpsBot",
+  token: "0xUSDC",
+  srcDomain: "base:treasury",
+  dstDomain: "ethereum:settlement",
+  maxTotal: "5000000000",
+  validAfter: 1720000000,
+  validBefore: 1730000000,
+  nonce: "0xnonceSalt",
+  metadataHash: "0xoptionalPolicyRef"
+});
 
-~~~
-
-revoke(auth);                 // SafeV2 (bound to grantor)
-revoke(authHash);             // primitive (hash-based)
-
-~~~
-
-See docs/RIP-001.md for full semantics.
-
----
-
-## Contracts
-
-| **Contract**             | **Purpose**                 | **Notes**                                                                                                                                                                                                                                                                             |
-|----------------------|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **RecurPull.sol**    | Minimal RIP-001 reference | Smallest surface to audit/extend. Includes **EIP-712** authorization, `verify → pull` flow, and simple revoke. Perfect for understanding & composing your own modules.                                                                    |
-| **RecurPullSafeV2.sol** | Hardened pilot template  | Adds cumulative cap, revocation bound to grantor, **EIP-1271** smart wallet support, optional **ERC-2612** `permit()`, reentrancy guard, and helper functions. Recommended starting point for pilots.                                      |
-
-Both implement the same **authorize → verify → pull → revoke** logic that defines the permissioned-pull standard.
-
----
-
-### Cross-Network Extensions
-
-RecurRelay.sol — [RIP-003 Draft]
-
-A minimal consent-status relay for cross-network liquidity coordination.
-
-It does **not** bridge, wrap, or custody assets.  
-Instead, it provides a portable proof surface for verifying whether a Permissioned Pull Object (PPO) remains active, revoked, or capped on its origin chain.  
-Destination-chain pull contracts may query this relay before executing a pull(), enabling *consented liquidity synchronization* across EVM networks.
-
-> This contract represents the first draft reference for RIP-003: Cross-Network Flow Messaging.
-
----
-
-## Folder Structure
-
-~~~
-
-contracts/
- ├─ RecurPull.sol
- └─ RecurPullSafeV2.sol
-docs/
- ├─ RIP-001.md
- ├─ RIP-002.md      # Authorization Registry & Events (optional index, draft)
- ├─ AUDIT_SUMMARY.md
- └─ CHANGELOG.md
-tests/
- └─ README.md
-LICENSE
-README.md
-
+const signature = await signFlowIntent(treasurySafeSigner, flowIntentRegistryAddr, flowIntent);
+const crossPayload = { ...flowIntent, authHash: someUnderlyingChannelOrPPOAuthHash, signature };
 ~~~
 
 ---
-
-## Audit Summary (informal)
--	✅ Domain separation (chainId + verifyingContract)  
--	✅ ECDSA (EOA) + EIP-1271 (SCW) signature verification (SafeV2)  
--	✅ Revocation (hash or grantor-bound)  
--	✅ Cumulative cap (SafeV2)  
--	✅ Reentrancy guard (SafeV2)  
--	✅ Zero address & time-window checks  
--	✅ permit() path (SafeV2) to avoid pre-approve UX  
-
-Recommended v1.1 improvements:
--	Use SafeERC20 for non-standard tokens  
--	Optional per-pull limit / rate-limit  
--	Permit2 compatibility  
-
-→ Full notes in docs/AUDIT_SUMMARY.md.
-
----
-
-## Specs & RIPs  
-	
-- RIP-001: Permissioned Pull Primitive (core standard)
-- RIP-002: Authorization Registry & Events (optional index layer, draft)
-
-Future RIPs: ERC-721 / 4626 adaptations, metered/streamed limits, cross-chain consent registries.
-
----
-
 
 ## Philosophy
 
@@ -211,7 +202,7 @@ Liquidity moves before failure; stability becomes emergent.
 
 ## Stewardship
 
-This repository is maintained by **Recur Labs** as the canonical reference for the permissioned-pull standard (RIP-001). 
+This repository is maintained by **Recur Labs** as the canonical reference for the permissioned-pull standard. 
 Recur Labs invites implementation feedback, formal audits, and ecosystem integrations.
 All text and code are © 2025 M J / Recur Labs under the Apache 2.0 License.
 
@@ -222,7 +213,7 @@ Recur is an open standard — not a financial instrument or investment project.
 
 ## Authorship & Attribution
 
-Recur (RIP-001) — The Permissioned-Pull Standard for Digital Value —
+Recur (RIP-001 → RIP-008) — The Permissioned-Pull Standard for Digital Value —
 was first published by **M J (Recur Labs)** in October 2025 as the original specification introducing *consented continuity* and *permissioned-pull flow* for EVM-based assets.
 
 All text, architecture, and reference code are © 2025 Recur Labs.
@@ -238,4 +229,3 @@ Any subsequent EIPs, ERCs, or derivative works referencing the permissioned-pull
 - Website: recurprotocol.com
 - Labs Updates: @recurlabs (X/Twitter)
 - Founder: @recurmj (X/Twitter)
-
