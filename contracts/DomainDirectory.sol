@@ -11,32 +11,30 @@ pragma solidity ^0.8.20;
 ///   keccak256("custodian:prime-broker-x")
 ///
 /// This contract is the source of truth for:
-///   - Which destination address (vault / receiver) is considered canonical
-///     for that domain.
-///   - Which adapter contract (if any) should be used to actually *execute*
-///     a pull on behalf of that domain (e.g. an EVMPPOAdapter or channel adapter).
-///   - Which executors are approved to act in that domain
-///     when driving CrossNetworkRebalancer.
+///   - Which destination address (vault / receiver) is canonical for that domain.
+///   - Which adapter contract (if any) should be used operationally to execute
+///     a pull on behalf of that domain.
+///   - Which executors are approved to act in that domain when driving
+///     CrossNetworkRebalancer.
 ///   - Whether the domain is currently active (routable).
 ///
 /// SECURITY MODEL
-///  - `controller` (expected to be a Safe / multisig / governance) is the
-///    only address allowed to configure domains or rotate control.
+///  - `controller` (Safe / multisig / governance) is the only address allowed
+///    to configure domains, approve executors, or rotate control.
 ///  - Setting active = false immediately offlines a domain for routing.
-///  - CrossNetworkRebalancer will:
-///      1. Check isApprovedExecutor(srcDomain, intent.executor)
-///         AND isApprovedExecutor(dstDomain, intent.executor)
-///      2. Fetch receiverOf(dstDomain)
-///  - CrossNetworkRebalancer does *not* read `adapter` directly in the final
-///    version, but we keep it here for completeness / off-chain coordination.
+///  - CrossNetworkRebalancer:
+///       1. checks isApprovedExecutor(srcDomain, intent.executor)
+///          and isApprovedExecutor(dstDomain, intent.executor)
+///       2. fetches receiverOf(dstDomain)
 ///
 /// IMPORTANT:
 ///  - DomainDirectory NEVER moves funds.
-///  - It just encodes policy/metadata for domains.
+///  - It's pure policy/metadata.
 ///
-/// UPGRADE / ROTATION:
-///  - controller can rotate, update executors, pause a domain, or point
-///    dst receivers somewhere else without touching every other contract.
+/// OPERATIONAL NOTE:
+///  - When you "turn off" a domain by setting active=false,
+///    you SHOULD also clear executor approvals for that domain (setExecutorApproval(..., false))
+///    so even stale callers get denied.
 contract DomainDirectory {
     /// -----------------------------------------------------------------------
     /// Data structures
@@ -45,7 +43,7 @@ contract DomainDirectory {
     struct DomainInfo {
         address adapter;        // domain's pull adapter (EVMPPOAdapter, FlowChannel adapter, etc.)
         address destination;    // canonical receiver / treasury / vault for this domain
-        bool active;            // if false, domain is considered offline / not routable
+        bool active;            // if false, domain is offline / not routable
     }
 
     /// domainId => DomainInfo
@@ -91,6 +89,7 @@ contract DomainDirectory {
 
     /// @param initialController governance address (usually a Safe / multisig)
     constructor(address initialController) {
+        require(initialController != address(0), "BAD_CTRL");
         controller = initialController;
     }
 
@@ -101,6 +100,7 @@ contract DomainDirectory {
     /// @notice Rotate governance / control authority.
     /// @param newController The address that will take over configuration rights.
     function setController(address newController) external onlyController {
+        require(newController != address(0), "BAD_CTRL");
         controller = newController;
         emit ControllerUpdated(newController);
     }
@@ -111,13 +111,12 @@ contract DomainDirectory {
     ///                    this MUST NOT be address(0).
     /// @param destination Canonical receiver for that domain. If `active` is true,
     ///                    this MUST NOT be address(0).
-    /// @param active      Whether this domain should currently be considered routable.
+    /// @param active      Whether this domain should currently be treated as routable.
     ///
     /// SETTING active = false:
     ///  - Immediately "offlines" the domain for routing / receiving.
-    ///  - CrossNetworkRebalancer should refuse to route to/from inactive domains
-    ///    because isApprovedExecutor() will return false for all executors if you
-    ///    also clear them, OR higher-level governance logic will check .active.
+    ///  - CrossNetworkRebalancer will effectively refuse to route there because
+    ///    isApprovedExecutor() will return false (it checks .active).
     function setDomain(
         bytes32 id,
         address adapter,
@@ -151,17 +150,15 @@ contract DomainDirectory {
     }
 
     /// -----------------------------------------------------------------------
-    /// Views consumed by CrossNetworkRebalancer and off-chain monitors
+    /// Views consumed by CrossNetworkRebalancer / monitoring
     /// -----------------------------------------------------------------------
 
-    /// @notice Returns true if `executor` is currently approved to operate in `domainId`.
-    /// @dev CrossNetworkRebalancer uses this to ensure that the caller's
-    ///      intent.executor is allowed in BOTH the source and destination domains.
+    /// @notice Returns true if `executor` is currently approved to operate in `domainId`
+    ///         AND the domain is active.
     function isApprovedExecutor(
         bytes32 domainId,
         address executor
     ) external view returns (bool) {
-        // If the domain itself is inactive, treat all executors as unapproved.
         DomainInfo memory info = domains[domainId];
         if (!info.active) {
             return false;
@@ -170,20 +167,20 @@ contract DomainDirectory {
     }
 
     /// @notice Canonical receiver / vault / treasury address for the given domain.
-    /// @dev CrossNetworkRebalancer sends funds here on the destination side.
+    /// @dev CrossNetworkRebalancer delivers funds here on the destination side.
     function receiverOf(bytes32 domainId) external view returns (address) {
         return domains[domainId].destination;
     }
 
     /// @notice Adapter contract for the domain.
-    /// @dev Optional convenience getter. Current CrossNetworkRebalancer version
-    ///      passes the adapter/contract address in externally instead of
-    ///      reading from here, but off-chain infra / ops dashboards will want this.
+    /// @dev Optional operational getter. Current CrossNetworkRebalancer version
+    ///      takes the adapter address directly as an argument, but infra/off-chain
+    ///      orchestration tooling inspects this.
     function adapterOf(bytes32 domainId) external view returns (address) {
         return domains[domainId].adapter;
     }
 
-    /// @notice Full tuple for explorers / monitoring.
+    /// @notice Full tuple for explorers / dashboards.
     function domainInfo(bytes32 domainId) external view returns (
         address adapter,
         address destination,
