@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
+/// @dev controller SHOULD be the TreasurySafe / governance multisig.
+///      This address can pause domains and rotate receivers. Treat as
+///      high-security infra.
 /// @title DomainDirectory
 /// @notice RIP-004 / RIP-008 governance registry for "domains"
 ///         (chains, L2 settlement vaults, custodians, internal treasuries).
