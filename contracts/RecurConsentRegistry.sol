@@ -2,41 +2,79 @@
 pragma solidity ^0.8.20;
 
 /// @title RecurConsentRegistry
-/// @notice Minimal consent / revocation index for permissioned-pull (RIP-001).
-/// @dev Matches RIP-002: tracks whether an authHash is still valid and emits canonical events.
-///      This contract does NOT move funds. It is the on-chain source of truth for
-///      "does this consent still exist, or has it been revoked?"
+/// @notice RIP-002 Consent / Revocation Registry for permissioned-pull (RIP-001).
+///
+/// @dev
+/// This contract is the canonical index for:
+///   - whether a given Permissioned Pull Object (PPO / Authorization) is still valid,
+///   - how much value has actually been pulled under it so far,
+///   - optional soft caps / budgets for reporting,
+///   - canonical events that wallets / auditors / explorers can consume.
+///
+/// IMPORTANT:
+/// - This contract never moves funds.
+/// - This contract does not enforce caps by itself.
+/// - Execution contracts (RecurPullSafeV2, FlowChannelHardened, CrossNetworkRebalancer, etc.)
+///   MUST consult this registry *before* honoring a pull, and MUST call recordPull()
+///   *after* a successful transfer.
+///
+/// Production hardening notes:
+/// - revoke(): in production MUST restrict caller to the true grantor of that authHash.
+/// - recordPull(): in production SHOULD restrict caller to trusted executors
+///   (e.g. known RecurPullSafeV2 instances / routers) to prevent spoofed accounting.
+/// - setCap(): this is advisory / UX only. Hard caps per-epoch / per-recipient should
+///   be enforced by PolicyEnforcer / FlowChannelHardened, not here.
 contract RecurConsentRegistry {
+    /// -----------------------------------------------------------------------
+    /// Storage
+    /// -----------------------------------------------------------------------
+
     // authHash => revoked?
     mapping(bytes32 => bool) public revoked;
 
-    // authHash => cumulative amount pulled so far (for accounting / analytics)
+    // authHash => cumulative amount pulled so far (accounting / audit trail)
     mapping(bytes32 => uint256) public totalPulled;
 
-    // OPTIONAL: track a soft cap for UI/compliance (not enforced here)
+    // OPTIONAL: advertised soft cap / budget for UI & compliance dashboards.
+    // This is not enforced here.
     mapping(bytes32 => uint256) public capOfAuth;
 
+    /// -----------------------------------------------------------------------
+    /// Events (canonical RIP-002 surface)
+    /// -----------------------------------------------------------------------
+
+    /// @notice Emitted when a pull succeeds under a still-valid Authorization.
+    /// @dev Indexers can reconstruct flow history and running totals per authHash.
+    /// Topics:
+    ///   authHash (idx 1), token (idx 2), grantor (idx 3)
     event PullExecuted(
         bytes32 indexed authHash,
         address indexed token,
         address indexed grantor,
         address grantee,
         uint256 amount,
-        uint256 cumulative
+        uint256 cumulative // totalPulled[authHash] after this pull
     );
 
+    /// @notice Emitted when a grantor revokes an Authorization.
+    /// @dev After this, compliant executors MUST refuse further pulls for this authHash.
     event AuthorizationRevoked(
         bytes32 indexed authHash,
         address indexed grantor,
         uint256 timestamp
     );
 
+    /// @notice Emitted when a soft cap (budget) is set or updated.
+    /// @dev Off-chain risk + compliance tooling can diff old/new.
     event AuthorizationBudgetUpdated(
         bytes32 indexed authHash,
         uint256 oldCap,
         uint256 newCap
     );
 
+    /// @notice Optional discovery hook.
+    /// @dev Lets UIs / explorers learn that "this consent exists between X and Y
+    ///      for token T" without revealing full Authorization terms.
     event AuthorizationObserved(
         bytes32 indexed authHash,
         address indexed grantor,
@@ -44,27 +82,49 @@ contract RecurConsentRegistry {
         address token
     );
 
+    /// -----------------------------------------------------------------------
+    /// Write functions
+    /// -----------------------------------------------------------------------
+
     /// @notice Grantor revokes consent for this authHash.
-    /// @dev After this, any compliant pull() MUST revert for this authHash.
+    /// @dev
+    ///  - In hardened deployments you MUST require msg.sender == the Authorization's grantor.
+    ///  - After this is called, any compliant pull() MUST revert for this authHash.
     function revoke(bytes32 authHash) external {
         revoked[authHash] = true;
-        emit AuthorizationRevoked(authHash, msg.sender, block.timestamp);
+
+        emit AuthorizationRevoked({
+            authHash:  authHash,
+            grantor:   msg.sender,
+            timestamp: block.timestamp
+        });
     }
 
-    /// @notice Optional discovery hook so UIs can list "this consent exists"
-    ///         without revealing full terms. Gated in production.
+    /// @notice Optional discovery hook so UIs / indexers can surface active consents.
+    /// @dev
+    ///  - In hardened deployments you'd likely gate this (only trusted issuers / wallets).
+    ///  - Does NOT mark anything as valid by itself; it's purely informational.
     function observe(
         bytes32 authHash,
         address grantor,
         address grantee,
         address token
     ) external {
-        emit AuthorizationObserved(authHash, grantor, grantee, token);
+        emit AuthorizationObserved({
+            authHash: authHash,
+            grantor:  grantor,
+            grantee:  grantee,
+            token:    token
+        });
     }
 
-    /// @notice Record a successful pull for accounting / analytics.
-    /// @dev Called by the pull executor after transfer succeeds.
-        // Emits PullExecuted with cumulative total.
+    /// @notice Record a successful pull for accounting / audit trail.
+    /// @dev
+    ///  - MUST be called only *after* the actual ERC-20 transferFrom()
+    ///    (grantor -> grantee) has succeeded in the executor contract.
+    ///  - In hardened deployments, restrict caller to known executors.
+    ///
+    /// Emits PullExecuted(authHash, token, grantor, grantee, amount, cumulative).
     function recordPull(
         bytes32 authHash,
         address token,
@@ -75,38 +135,52 @@ contract RecurConsentRegistry {
         uint256 newTotal = totalPulled[authHash] + amount;
         totalPulled[authHash] = newTotal;
 
-        emit PullExecuted(
-            authHash,
-            token,
-            grantor,
-            grantee,
-            amount,
-            newTotal
-        );
+        emit PullExecuted({
+            authHash:   authHash,
+            token:      token,
+            grantor:    grantor,
+            grantee:    grantee,
+            amount:     amount,
+            cumulative: newTotal
+        });
     }
 
-    /// @notice Optional soft cap (not enforced here).
-    /// @dev In hardened version you'd restrict this to the grantor.
-    function setCap(
-        bytes32 authHash,
-        uint256 oldCap,
-        uint256 newCap
-    ) external {
+    /// @notice Set or update an advertised budget / soft cap for analytics & UI.
+    /// @dev
+    ///  - NOT enforced here.
+    ///  - In hardened deployments you'd restrict this to the grantor / controller
+    ///    of the authHash.
+    ///
+    /// Emits AuthorizationBudgetUpdated(authHash, oldCap, newCap).
+    function setCap(bytes32 authHash, uint256 newCap) external {
+        uint256 oldCap = capOfAuth[authHash];
         capOfAuth[authHash] = newCap;
-        emit AuthorizationBudgetUpdated(authHash, oldCap, newCap);
+
+        emit AuthorizationBudgetUpdated({
+            authHash: authHash,
+            oldCap:   oldCap,
+            newCap:   newCap
+        });
     }
 
-    /// @notice True if this authHash has been revoked by its grantor.
+    /// -----------------------------------------------------------------------
+    /// Read functions
+    /// -----------------------------------------------------------------------
+
+    /// @notice True if this authHash has been revoked.
+    /// @dev Execution contracts MUST check this before honoring a pull.
     function isRevoked(bytes32 authHash) external view returns (bool) {
         return revoked[authHash];
     }
 
-    /// @notice How much has been pulled under this authHash so far.
+    /// @notice Total cumulative amount recorded as pulled under this authHash.
+    /// @dev Indexers / auditors can use this for exposure reporting.
     function pulledTotal(bytes32 authHash) external view returns (uint256) {
         return totalPulled[authHash];
     }
 
-    /// @notice Optional helper for UI/analytics.
+    /// @notice Advisory soft cap / budget for this authHash (0 if unset).
+    /// @dev Useful for dashboards, limits monitoring, compliance tooling.
     function capOf(bytes32 authHash) external view returns (uint256) {
         return capOfAuth[authHash];
     }
