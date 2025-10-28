@@ -18,12 +18,19 @@ pragma solidity ^0.8.20;
 ///   MUST consult this registry *before* honoring a pull, and MUST call recordPull()
 ///   *after* a successful transfer.
 ///
-/// Production hardening notes:
-/// - revoke(): in production MUST restrict caller to the true grantor of that authHash.
-/// - recordPull(): in production SHOULD restrict caller to trusted executors
-///   (e.g. known RecurPullSafeV2 instances / routers) to prevent spoofed accounting.
-/// - setCap(): this is advisory / UX only. Hard caps per-epoch / per-recipient should
-///   be enforced by PolicyEnforcer / FlowChannelHardened, not here.
+/// @custom:security revoke()
+///   In production, MUST restrict caller so only the true grantor tied to `authHash`
+///   can revoke. (Typically: bind `authHash -> grantor` on first valid pull and require
+///   msg.sender == that grantor for future revoke().)
+///
+/// @custom:security recordPull()
+///   In production, SHOULD restrict caller to trusted executors
+///   (RecurPullSafeV2, FlowChannelHardened, routers) so random callers
+///   can't spoof accounting.
+///
+/// @custom:security setCap()
+///   This is advisory only. Hard enforcement of budgets/rate/receivers should
+///   live in PolicyEnforcer / FlowChannelHardened.
 contract RecurConsentRegistry {
     /// -----------------------------------------------------------------------
     /// Storage
