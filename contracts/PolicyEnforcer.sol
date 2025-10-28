@@ -214,6 +214,7 @@ contract PolicyEnforcer {
     ///
     /// Reverts if:
     /// - policy is revoked,
+    /// - msg.sender lied about who caller is,
     /// - caller != grantee,
     /// - amount > maxPerPull,
     /// - amount would push this epoch over maxPerEpoch,
@@ -231,7 +232,14 @@ contract PolicyEnforcer {
         Policy storage p = policies[policyId];
 
         require(!p.revoked, "POLICY_REVOKED");
+
+        // New anti-spoof hardening:
+        // Force the executor contract to prove "I am caller".
+        // This prevents a malicious contract from pretending to act
+        // on behalf of the real grantee just by passing their address.
+        require(msg.sender == caller, "CALLER_SPOOF");
         require(caller == p.grantee, "UNAUTHORIZED_GRANTEE");
+
         require(amount > 0, "AMOUNT_0");
         require(amount <= p.maxPerPull, "EXCEEDS_PULL");
 
