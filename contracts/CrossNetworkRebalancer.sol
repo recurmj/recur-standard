@@ -1,84 +1,115 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
-/// @title CrossNetworkRebalancer — RIP-004 reference
-/// @notice Non-custodial executor that fulfills a Flow Intent (RIP-003) across domains
-///         by triggering permissioned pulls under revocable consent,
-///         instead of bridging, wrapping, or taking custody.
-/// @dev This contract never holds funds. It only coordinates allowed movement.
-///      Controller should be a Safe / multisig in production.
+/// @title CrossNetworkRebalancer
+/// @notice RIP-004 reference executor. Moves liquidity across "domains"
+///         (chains, L2s, custodians, treasuries) without bridging, wrapping,
+///         pooled custody, or holding funds.
+/// @dev
+/// - This contract NEVER escrows funds. It only coordinates authorized pulls
+///   under revocable consent.
+/// - A FlowIntent (RIP-003) says:
+///       "executor X may move up to maxTotal of token
+///        from srcDomain to dstDomain before validBefore."
+/// - CrossNetworkRebalancer checks that intent is still valid,
+///   checks executor permissions in both domains,
+///   checks the underlying pull authorization (PPO / authHash) is still live,
+///   then instructs a source-domain pull adapter to move funds
+///   directly from the grantor toward the destination receiver.
+///
+/// Important trust points:
+/// - FlowIntentRegistry is assumed to have already verified the grantor's
+///   EIP-712 signature for this intent and registered it.
+/// - DomainDirectory encodes who is allowed to act in a domain
+///   and where funds should land in that domain.
+/// - The source pull adapter (IRecurPullLike) is assumed to enforce
+///   the lower-level Permissioned Pull Object (PPO) rules:
+///   signature validity, per-call ceiling (maxPerPull),
+///   time window, revocation, etc.
+/// - The Consent Registry (RIP-002) must reflect PPO revocation in real time.
+/// - `controller` is a Safe / multisig that can batch-call or rotate control.
+///
+/// This contract is deliberately scoped and auditable:
+/// no custody, no wrapping. It is a trigger, not a bridge.
 
-/// @notice Minimal interface for the FlowIntentRegistry (RIP-003).
-/// Tracks whether an intent is revoked and how much has already been executed.
+/// @notice FlowIntentRegistry (RIP-003)
+/// Tracks whether an intent is revoked, how much has been consumed,
+/// and records new executions. Also expected to have validated the
+/// grantor's signature off-chain or at registration time.
 interface IFlowIntentRegistry {
     function isRevoked(bytes32 intentHash) external view returns (bool);
     function consumed(bytes32 intentHash) external view returns (uint256);
     function recordExecution(bytes32 intentHash, uint256 amount) external;
 }
 
-/// @notice Minimal interface for the Consent Registry (RIP-002).
-/// Used to confirm that the underlying pull authorization (PPO) is still live.
+/// @notice Consent Registry (RIP-002)
+/// Global source of truth for whether the underlying PPO / Authorization
+/// (referred to by authHash) is still valid.
 interface IRecurConsentRegistry {
     function isRevoked(bytes32 authHash) external view returns (bool);
 }
 
-/// @notice DomainDirectory exposes routing metadata for domains like
-/// "ethereum:treasury", "base:settlement", "custodian:x".
-/// It answers:
-///  - Is this executor actually allowed to act in this domain?
-///  - Where should funds land for this domain?
+/// @notice DomainDirectory links abstract "domains" (like "ethereum:treasury"
+/// or "base:settlement" or "custodian:x") to:
+///  - which executors are permitted to act there
+///  - which address is the designated receiver in that domain
 interface IDomainDirectory {
     function isApprovedExecutor(bytes32 domainId, address executor) external view returns (bool);
     function receiverOf(bytes32 domainId) external view returns (address);
 }
 
-/// @notice Minimal pull surface compatible with RIP-001 / RecurPullSafeV2.
-/// The executor calls pull() on the source side under grantor consent.
-/// The contract itself enforces signature validity, revocation, caps, etc.
+/// @notice Source-side pull adapter interface.
+/// This adapter sits in the source domain and actually performs the consented pull
+/// under RIP-001 / RecurPullSafeV2 semantics. It MUST:
+///   - enforce the PPO's per-call ceiling (maxPerPull),
+///   - enforce PPO timing window,
+///   - verify PPO signature,
+///   - check registry revocation,
+///   - and transfer directly from the grantor to `to`.
+///
+/// CrossNetworkRebalancer never takes custody; it just asks this adapter to act.
 interface IRecurPullLike {
-    function pull(bytes32 authHash, uint256 amount) external returns (bool ok);
+    function pull(
+        bytes32 authHash,
+        address to,
+        uint256 amount
+    ) external returns (bool ok);
 }
 
-/// @notice A FlowIntent is the signed instruction (RIP-003) describing
-/// "move up to maxAmount of token from srcDomain to dstDomain before validBefore,
-/// and only executor X is allowed to do it."
-///
-/// We assume the off-chain signer (grantor) produced this and it was registered
-/// in a FlowIntentRegistry that can give us canonical state.
-///
-/// For simplicity, we pass it in as a struct here instead of bytes.
-/// In a hardened version, you'd pass the full EIP-712 payload + signature
-/// and verify it on-chain.
+/// @notice FlowIntent (RIP-003 core object, projected here)
+/// Describes cross-domain target movement under explicit grantor consent.
+/// We assume FlowIntentRegistry has already verified its EIP-712 signature
+/// from `grantor` and registered the canonical parameters.
 struct FlowIntent {
-    address grantor;        // owner of the liquidity
-    address executor;       // who is allowed to act on this intent
-    address token;          // asset to move
-    bytes32 srcDomain;      // domain where funds currently sit
-    bytes32 dstDomain;      // domain where funds should land
-    uint256 maxAmount;      // cap (total) authorized under this intent
+    address grantor;        // owner of the liquidity / signer of the intent
+    address executor;       // who is authorized to act on this intent
+    address token;          // asset being rebalanced
+    bytes32 srcDomain;      // where funds are coming from
+    bytes32 dstDomain;      // where funds should land
+    uint256 maxTotal;       // TOTAL cap (all executions combined) under this intent
     uint256 validBefore;    // expiry timestamp
     uint256 nonce;          // uniqueness / replay isolation
-    bytes32 authHash;       // underlying PPO / pull authorization hash
-    bytes   signature;      // grantor signature over the FlowIntent (EIP-712)
+    bytes32 authHash;       // PPO / pull authorization hash for the source funds
+    bytes   signature;      // grantor signature (not rechecked here; registry is source of truth)
 }
 
-/// @notice CrossNetworkRebalancer enforces FlowIntent + registry state.
-/// It does two main checks before attempting movement:
-///  1. The FlowIntent is still valid (not revoked, not expired, not over cap).
-///  2. The executor is allowed to act in both the source and destination domains.
+/// @title CrossNetworkRebalancer
+/// @dev This contract enforces:
+///  1. intent not revoked, not expired
+///  2. total usage so far + this amount <= maxTotal
+///  3. caller is authorized (executor or controller)
+///  4. executor is approved in BOTH src & dst domains
+///  5. underlying pull authorization (authHash) is still live
+///  6. destination receiver for dstDomain is known and nonzero
+///  7. source-side pull adapter successfully moved funds DIRECTLY to that receiver
 ///
-/// If those hold, it triggers a permissioned pull from the source domain
-/// (under the grantor's PPO / authHash) directly into the destination's receiver.
-///
-/// The Rebalancer never escrows funds. Movement is direct:
-///    grantor/source -> approved receiver/destination
+/// If all checks pass, we record usage in FlowIntentRegistry and emit.
 contract CrossNetworkRebalancer {
     IFlowIntentRegistry public intents;
     IRecurConsentRegistry public consent;
     IDomainDirectory public directory;
-    address public controller;
+    address public controller; // governance / Safe / multisig
 
-    /// @notice Emitted when we successfully execute part of a FlowIntent.
     event RebalanceExecuted(
         bytes32 indexed intentHash,
         bytes32 indexed srcDomain,
@@ -89,7 +120,7 @@ contract CrossNetworkRebalancer {
     );
 
     modifier onlyController() {
-        require(msg.sender == controller, "not controller");
+        require(msg.sender == controller, "NOT_CONTROLLER");
         _;
     }
 
@@ -105,27 +136,32 @@ contract CrossNetworkRebalancer {
         controller = initialController;
     }
 
-    /// @notice Controller (Safe / governance) can update control.
     function setController(address next) external onlyController {
         controller = next;
     }
 
-    /// @notice Execute part of a FlowIntent, moving `amount` toward dstDomain.
-    /// @dev In hardened form:
-    ///  - verify FlowIntent.signature via EIP-712
-    ///  - check chain/domain binding for src/dst
-    ///  - restrict callable roles (e.g. only the named executor, or onlyController driving batches)
+    /// @notice Execute part of a FlowIntent, moving `amount` of liquidity from
+    ///         `intent.srcDomain` toward `intent.dstDomain`.
+    /// @param intent Full FlowIntent struct. MUST match what FlowIntentRegistry
+    ///               registered under its hash.
+    /// @param amount Amount to attempt this step. Must be > 0.
+    /// @param sourcePullContract Address of the source-domain pull adapter
+    ///        (IRecurPullLike). That adapter actually executes the consented pull
+    ///        under the PPO identified by `authHash`.
     ///
-    /// @param intent the FlowIntent (RIP-003) describing desired cross-domain move
-    /// @param amount how much to attempt to move in this step
-    /// @param sourcePullContract address of the RecurPull-like contract in the source domain
+    /// Security expectations:
+    /// - FlowIntentRegistry already validated the grantor's signature and
+    ///   stored this intent.
+    /// - recordExecution() in that registry MUST be access-controlled so only
+    ///   this contract / controller can increment usage (to prevent spoofing).
     function executeFlowIntent(
         FlowIntent calldata intent,
         uint256 amount,
         address sourcePullContract
     ) external returns (bool ok) {
-        // 1. basic validity checks against intent registry ------------------
+        require(amount > 0, "ZERO_AMOUNT");
 
+        // 1. Canonical intent hash (must match FlowIntentRegistry derivation)
         bytes32 intentHash = keccak256(
             abi.encode(
                 intent.grantor,
@@ -133,67 +169,54 @@ contract CrossNetworkRebalancer {
                 intent.token,
                 intent.srcDomain,
                 intent.dstDomain,
-                intent.maxAmount,
+                intent.maxTotal,
                 intent.validBefore,
                 intent.nonce
             )
         );
 
-        require(!intents.isRevoked(intentHash), "intent revoked");
-        require(block.timestamp <= intent.validBefore, "intent expired");
+        // Intent must be live.
+        require(!intents.isRevoked(intentHash), "INTENT_REVOKED");
+        require(block.timestamp <= intent.validBefore, "INTENT_EXPIRED");
 
-        // Cap enforcement: don't exceed maxAmount across all executions.
+        // Enforce total cap across all executions.
         uint256 used = intents.consumed(intentHash);
-        require(used + amount <= intent.maxAmount, "cap exceeded");
+        require(used + amount <= intent.maxTotal, "CAP_EXCEEDED");
 
-        // 2. executor permissions ------------------------------------------
-
-        // Only the authorized executor may trigger this intent,
-        // OR governance may batch-call on their behalf (optional).
+        // 2. Caller authority
+        // Either the named executor calls directly, OR controller batches on their behalf.
         require(
             msg.sender == intent.executor || msg.sender == controller,
-            "not authorized executor"
+            "NOT_AUTHORIZED_EXECUTOR"
         );
 
-        // The executor (or controller) must be approved for BOTH src and dst domains.
+        // Executor must be approved for BOTH src and dst domains.
         require(
             directory.isApprovedExecutor(intent.srcDomain, intent.executor),
-            "src domain no exec"
+            "SRC_EXEC_FORBIDDEN"
         );
         require(
             directory.isApprovedExecutor(intent.dstDomain, intent.executor),
-            "dst domain no exec"
+            "DST_EXEC_FORBIDDEN"
         );
 
-        // 3. underlying consent (PPO / authHash) still live ----------------
+        // 3. Underlying PPO / pull auth must still be live (RIP-002 revocation check)
+        require(!consent.isRevoked(intent.authHash), "PPO_REVOKED");
 
-        // authHash is the RIP-001/RIP-002 identifier of the permissioned pull.
-        // If it's revoked at the Consent Registry layer, we refuse to act.
-        require(!consent.isRevoked(intent.authHash), "pull auth revoked");
-
-        // 4. figure out destination receiver for dstDomain -----------------
-
+        // 4. Destination receiver for dstDomain
         address dstReceiver = directory.receiverOf(intent.dstDomain);
-        require(dstReceiver != address(0), "no dst receiver");
+        require(dstReceiver != address(0), "NO_DST_RECEIVER");
 
-        // 5. actually perform the pull on the source domain ----------------
-        //
-        // Assumption:
-        // - sourcePullContract is deployed on (or bound to) the source domain
-        // - calling pull() there moves funds from grantor toward dstReceiver
-        //   under the grantor's PPO (authHash)
-        //
-        // NOTE: This call is *non-custodial*. We never receive the funds here.
+        // 5. Perform the actual non-custodial pull on the source side.
+        //    The adapter enforces per-call maxPerPull, timing, sig validity, etc.
         ok = IRecurPullLike(sourcePullContract).pull(
             intent.authHash,
+            dstReceiver,
             amount
         );
+        require(ok, "PULL_FAIL");
 
-        require(ok, "pull failed");
-
-        // 6. accounting / emit ---------------------------------------------
-
-        // Record consumption so we can't replay forever.
+        // 6. Record usage and emit.
         intents.recordExecution(intentHash, amount);
 
         emit RebalanceExecuted(
