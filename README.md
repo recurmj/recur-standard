@@ -209,6 +209,8 @@ All text and code are © 2025 M J / Recur Labs under the Apache 2.0 License.
 There is **no token** associated with this repository.
 Recur is an open standard — not a financial instrument or investment project.
 
+v1.0.0 frozen reference (IPFS snapshot): bafkreigvnilhcfwvn6y7ew2emzo5ofqy5epp7q7z7itk3cdtggoet6t5ra
+
 ---
 
 ## Authorship & Attribution
