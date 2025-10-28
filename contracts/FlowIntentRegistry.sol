@@ -1,4 +1,4 @@
-/// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
 /// @title FlowIntentRegistry
@@ -7,7 +7,7 @@ pragma solidity ^0.8.20;
 /// @custom:author Recur Labs
 ///
 /// A FlowIntent says:
-///   "executor X is allowed to move up to maxTotal of token T
+///   "executor X may move up to maxTotal of token T
 ///    from srcDomain → dstDomain for me (grantor),
 ///    during [validAfter, validBefore]."
 ///
@@ -28,7 +28,7 @@ pragma solidity ^0.8.20;
 ///
 /// 3. If we didn't revert, CrossNetworkRebalancer is cleared to actually
 ///    perform the domain-to-domain movement using permissioned pull.
-///    Funds STILL never touch this contract.
+///    Funds NEVER touch this contract.
 ///
 /// 4. The grantor can revoke a specific intentHash at any time.
 ///    After revoke, verifyAndConsume() will always revert for that intent.
@@ -38,20 +38,19 @@ pragma solidity ^0.8.20;
 /// - This registry never moves funds.
 /// - We bind each intentHash to its grantor (ownerOfIntent) on first success,
 ///   so only that wallet can revoke.
-/// - We do NOT route or pull funds here. That happens in RIP-004
-///   (CrossNetworkRebalancer + domain adapters).
+/// - We do NOT route or pull funds here. That's RIP-004 (CrossNetworkRebalancer).
 ///
 /// Executor enforcement
 /// --------------------
-/// - We do NOT check that msg.sender == i.executor here. That is enforced
-///   in CrossNetworkRebalancer. This lets governance/controller batch actions
-///   while still obeying per-intent limits.
+/// - We do NOT check that msg.sender == i.executor here. CrossNetworkRebalancer
+///   enforces executor authorization and domain allowlists. This lets governance
+///   batch with a controller address while still respecting per-intent caps.
 ///
 /// Replay safety
 /// -------------
 /// - The EIP-712 domain separator includes chainId and address(this),
 ///   so signatures cannot replay across networks or cloned registries.
-/// - nonce inside the FlowIntent makes each intent unique.
+/// - `nonce` inside the FlowIntent makes each intent unique.
 interface IEIP1271 {
     function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
 }
@@ -71,7 +70,7 @@ library ECDSARecover {
             v := byte(0, mload(add(sig, 96)))
         }
 
-        // normalize v
+        // normalize v (allow 0/1 style)
         if (v < 27) {
             v += 27;
         }
@@ -224,11 +223,11 @@ contract FlowIntentRegistry {
         intentHash = _hashIntent(i);
         require(!revoked[intentHash], "REVOKED");
 
-        // enforce cumulative cap
+        // Enforce cumulative cap
         uint256 newMoved = movedSoFar[intentHash] + amountToMove;
         require(newMoved <= i.maxTotal, "CAP_EXCEEDED");
 
-        // verify signature from grantor (EIP-712)
+        // Verify signature from grantor (EIP-712)
         bytes32 dig = _digest(i);
 
         if (_isContract(i.grantor)) {
