@@ -3,31 +3,42 @@ pragma solidity ^0.8.20;
 
 /// @title FlowChannelHardened — RIP-005 hardened reference
 /// @notice Continuous, rate-limited, revocable payment channel with optional policy enforcement.
+///
 /// @dev
-/// - Grantor authorizes continuous accrual to a grantee.
-/// - Value accrues over time at `ratePerSecond`, up to `maxBalance`.
-/// - Grantee can pull accrued funds in chunks (no custody here; funds go grantor -> destination).
-/// - Grantor can pause(), resume(), updateRate(), or revoke() at any time.
-/// - Optional policyEnforcer (RIP-007) is called before each pull to enforce compliance / KYC / caps.
+/// High-level model:
+/// - A grantor authorizes continuous accrual of an ERC20 balance to a grantee,
+///   at `ratePerSecond`, capped by `maxBalance`.
+/// - The grantee can call pull() to direct funds to any receiver `to`.
+///   Funds NEVER sit in this contract — they flow grantor -> `to` via transferFrom.
+/// - The grantor can pause(), resume(), updateRate(), or revoke() at any time.
+/// - Optionally, a PolicyEnforcer (RIP-007) is checked on each pull()
+///   to enforce budgets / receiver allowlists / jurisdictional rules.
 ///
-/// SECURITY MODEL
-/// - This contract NEVER holds user funds. It just calls `transferFrom(grantor, to, amount)`.
-///   => Grantor must approve this contract as spender on the token.
-/// - If paused or revoked, accrual stops and pull() reverts.
+/// Security model:
+/// - This contract NEVER escrows tokens. It just calls
+///     ERC20(token).transferFrom(grantor, to, amount)
+///   during pull().
+///   => The grantor must have given this contract sufficient allowance,
+///      or pull() will revert with TRANSFER_FAIL.
+/// - pause() and revoke() are instant kill switches:
+///     * paused  => accrual stops *and* pull() reverts, but can later resume().
+///     * revoked => accrual frozen forever; pull() will always revert.
 /// - Reentrancy is guarded.
-/// - AdaptiveRouter (RIP-006) and SettlementMesh (RIP-008) can coordinate pulls by setting
-///   themselves as the grantee, or by acting as destinations depending on deployment.
+/// - AdaptiveRouter (RIP-006) / SettlementMesh (RIP-008) can be the grantee
+///   so they can orchestrate rebalancing without custody.
 ///
-/// AUDIT-READY BEHAVIOR
-/// - Accrual math is deterministic: accrued += ratePerSecond * dt, then capped at maxBalance.
-/// - `_sync()` is always called before state transitions that depend on `accrued`.
-/// - `claimable()` simulates `_sync()` without mutating, for routing decisions.
+/// Accounting model:
+/// - Accrual math is deterministic:
+///     accrued += ratePerSecond * dt
+///     capped at maxBalance
+/// - _sync() is called before any state mutation that depends on up-to-date accrual.
+/// - claimable() simulates that same math in view-only mode without mutating.
 ///
-/// INTEGRATION EXPECTATION
-/// - For institutional treasuries, each Channel maps 1:1 to:
-///     "stream token T from grantor → grantee at rate R, buffer-capped at B".
-/// - AdaptiveRouter picks *which* channel to drain and *where* to send it (the `to` param).
-/// - PolicyEnforcer (if present) can enforce jurisdiction allowlists, per-epoch ceilings, etc.
+/// Integration expectations:
+/// - One channel ~= "stream token T from grantor → grantee at rate R,
+///   with a buffer cap of B".
+/// - AdaptiveRouter decides *which* channel to drain and *where* to send the funds (`to`).
+/// - PolicyEnforcer can enforce spend ceilings per epoch, receiver allowlists, etc.
 interface ITrackedERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
@@ -35,10 +46,10 @@ interface ITrackedERC20 {
 interface IPolicyEnforcer {
     /// @notice MUST revert if this pull should not be allowed.
     /// @dev Typical checks:
-    ///  - caller is approved
-    ///  - `to` is on an allowlist
+    ///  - caller is the approved grantee
+    ///  - `to` is allowed
     ///  - amount fits per-epoch / per-day budget
-    ///  - consume against running budget
+    ///  - consume budget
     function checkAndConsume(
         bytes32 policyId,
         address caller,
@@ -47,8 +58,7 @@ interface IPolicyEnforcer {
     ) external;
 }
 
-/// @dev Minimal in-contract reentrancy guard.
-/// We keep this local (not OZ import) to make the reference maximally portable.
+/// @dev Minimal in-contract reentrancy guard (kept local for portability).
 abstract contract ReentrancyGuardFC {
     uint256 private _status = 1;
     modifier nonReentrant() {
@@ -61,25 +71,25 @@ abstract contract ReentrancyGuardFC {
 
 contract FlowChannelHardened is ReentrancyGuardFC {
     struct Channel {
-        address grantor;          // who is ultimately paying
+        address grantor;          // who ultimately pays
         address grantee;          // who is authorized to call pull()
         address token;            // ERC-20 being streamed
 
-        uint256 ratePerSecond;    // tokens/sec that accrue
+        uint256 ratePerSecond;    // tokens/sec accruing to grantee
         uint256 maxBalance;       // cap on accrued buffer
 
-        uint256 accrued;          // currently claimable
+        uint256 accrued;          // currently claimable (after last _sync)
         uint64  lastUpdate;       // last accrual timestamp (unix seconds)
 
-        bool paused;              // true => accrual stops, pull() reverts
-        bool revoked;             // true => permanently dead
+        bool paused;              // if true: accrual stops, pull() reverts (but can resume)
+        bool revoked;             // if true: dead forever (no accrual, no pull ever again)
 
         // Optional policy layer (RIP-007)
-        address policyEnforcer;   // contract implementing IPolicyEnforcer
+        address policyEnforcer;   // contract that enforces spend rules
         bytes32 policyId;         // policy key understood by that enforcer
     }
 
-    /// @notice channelId (bytes32) → Channel
+    /// channelId (bytes32) => Channel
     mapping(bytes32 => Channel) public channels;
 
     // -----------------------------------------------------------------------
@@ -113,8 +123,8 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     event ChannelResumed(bytes32 indexed id);
     event ChannelRevoked(bytes32 indexed id);
 
-    /// @notice Fired whenever value is actually streamed out of the channel.
-    /// @dev `to` is the final receiver of funds in this pull().
+    /// @notice Fired whenever value actually streams out.
+    /// @dev `to` is the final receiver of the funds in this pull().
     event Pulled(bytes32 indexed id, address to, uint256 amount);
 
     // -----------------------------------------------------------------------
@@ -140,16 +150,26 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     /// @param grantee         Address allowed to call pull() / spend the stream.
     /// @param token           ERC-20 being streamed.
     /// @param ratePerSecond   Tokens per second that accrue.
-    /// @param maxBalance      Maximum unclaimed buffer before accrual caps.
+    /// @param maxBalance      Maximum unclaimed buffer before accrual stops.
     /// @param policyEnforcer  Optional policy module (address(0) = none).
     /// @param policyId        Policy identifier for that enforcer.
+    ///
+    /// @dev
+    /// NON-CUSTODIAL CONSENT MODEL:
+    /// - This contract NEVER escrows tokens.
+    /// - pull() calls token.transferFrom(grantor -> receiver).
+    /// - Therefore the grantor MUST have given this contract sufficient ERC20 allowance
+    ///   (via token.approve(address(this), amount)) before any pull can succeed.
+    /// - If allowance is missing or too low, pull() will revert with TRANSFER_FAIL.
+    ///
+    /// SAFETY:
+    /// - The grantor can yank or reduce allowance at any time to cut off outflow,
+    ///   even without pausing/revoking the channel.
     ///
     /// Requirements:
     /// - `id` must not already exist.
     /// - `ratePerSecond` > 0 and `maxBalance` > 0.
     /// - `grantee` and `token` must be nonzero.
-    /// - Grantor MUST separately `approve()` this contract as ERC20 spender
-    ///   or nothing can actually transfer.
     function openChannel(
         bytes32 id,
         address grantee,
@@ -186,7 +206,7 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     // -----------------------------------------------------------------------
 
     /// @dev Sync a channel's `accrued` balance up to `block.timestamp`.
-    ///      Accrual stops if paused or revoked.
+    ///      Accrual stops immediately if paused or revoked.
     function _sync(bytes32 id) internal {
         Channel storage c = channels[id];
 
@@ -195,8 +215,8 @@ contract FlowChannelHardened is ReentrancyGuardFC {
             return;
         }
 
-        // If paused or revoked, accrual halts. We still bump lastUpdate so dt
-        // doesn't accumulate infinitely while paused.
+        // If paused or revoked, accrual halts. Still bump lastUpdate
+        // so dt doesn't accumulate while off.
         if (c.revoked || c.paused) {
             c.lastUpdate = uint64(block.timestamp);
             return;
@@ -226,20 +246,28 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     /// @param to     Final receiver of funds on this chain.
     /// @param amount Amount to pull right now.
     ///
+    /// @dev
+    /// NON-CUSTODIAL TRANSFER:
+    /// - This contract does NOT hold tokens.
+    /// - It simply calls token.transferFrom(grantor -> to, amount).
+    /// - The grantor MUST maintain ERC20 allowance for this contract or
+    ///   pull() will revert with TRANSFER_FAIL.
+    ///
+    /// EMERGENCY CONTROL:
+    /// - Grantor can pause() (or revoke()) the channel, which halts accrual
+    ///   and makes pull() revert.
+    /// - Grantor can also drop allowance on the ERC20 itself.
+    ///
     /// Requirements:
     /// - Caller MUST be the channel's grantee.
     /// - Channel MUST NOT be paused or revoked.
     /// - `amount` > 0 and `amount` ≤ claimable() at this instant.
     /// - `to` cannot be address(0).
     ///
-    /// On success:
+    /// Effects on success:
     /// - `accrued` is reduced.
-    /// - Token is transferred via ERC20.transferFrom(grantor -> to).
-    /// - PolicyEnforcer (if set) can veto or meter this spend first.
-    ///
-    /// SECURITY:
-    /// - This contract never takes custody — funds flow grantor → `to` directly.
-    /// - Grantor controls allowance. If allowance is yanked, pull() will just fail.
+    /// - Optional PolicyEnforcer is checked and consumes budget.
+    /// - ERC20 tokens move directly grantor -> `to`.
     function pull(bytes32 id, address to, uint256 amount)
         external
         nonReentrant
@@ -266,10 +294,10 @@ contract FlowChannelHardened is ReentrancyGuardFC {
             );
         }
 
-        // Deduct BEFORE external call
+        // Deduct BEFORE external transferFrom()
         c.accrued -= amount;
 
-        // Non-custodial transfer
+        // Non-custodial transfer out of the grantor's balance.
         require(
             ITrackedERC20(c.token).transferFrom(c.grantor, to, amount),
             "TRANSFER_FAIL"
@@ -282,17 +310,36 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     // Grantor controls
     // -----------------------------------------------------------------------
 
-    /// @notice Pause accrual + block pulls (but do not revoke permanently).
-    /// @dev We _sync first so `accrued` reflects balance up to this pause boundary.
+    /// @notice Pause accrual and block pulls (but do not permanently revoke).
+    ///
+    /// @dev
+    /// Behavior:
+    /// - After pause():
+    ///    * accrual stops,
+    ///    * pull() will revert,
+    ///    * channel can later resume().
+    ///
+    /// Implementation detail:
+    /// - We _sync first to snapshot accrued up to "now",
+    ///   THEN mark paused=true.
     function pause(bytes32 id) external onlyGrantor(id) {
         Channel storage c = channels[id];
-        c.paused = true;
-        _sync(id);
+        _sync(id);          // snapshot first for clean accounting
+        c.paused = true;    // then flip the flag
         emit ChannelPaused(id);
     }
 
     /// @notice Resume accrual and allow pulls again.
-    /// @dev We reset `lastUpdate` so accrual restarts from "now".
+    ///
+    /// @dev
+    /// Behavior:
+    /// - After resume():
+    ///    * accrual restarts from the current timestamp,
+    ///    * pull() is allowed again (unless revoked separately).
+    ///
+    /// Implementation detail:
+    /// - We clear paused AFTER ensuring not revoked,
+    ///   and reset lastUpdate to "now" so accrual restarts cleanly.
     function resume(bytes32 id) external onlyGrantor(id) {
         Channel storage c = channels[id];
         require(!c.revoked, "REVOKED");
@@ -302,21 +349,37 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     }
 
     /// @notice Permanently revoke a channel.
-    /// @dev After revoke():
-    ///  - accrual is frozen forever
-    ///  - pull() will revert
-    ///  - any remaining `accrued` is effectively stranded unless you add a custom unwind path
-    ///    (this is deliberate: revoke() is a hard kill switch)
+    ///
+    /// @dev
+    /// Behavior:
+    /// - After revoke():
+    ///    * accrual is frozen forever,
+    ///    * pull() will always revert,
+    ///    * channel cannot be resumed.
+    /// - Any remaining `accrued` is effectively stranded unless you implement
+    ///   an explicit "recover leftovers" path in a custom fork. We intentionally
+    ///   do NOT provide that here — revoke() is an emergency hard kill.
+    ///
+    /// Implementation detail:
+    /// - We _sync first so accrued reflects earnings up to this exact revoke boundary,
+    ///   THEN mark revoked=true.
     function revoke(bytes32 id) external onlyGrantor(id) {
         Channel storage c = channels[id];
-        c.revoked = true;
-        _sync(id); // snapshot final accrued for audit visibility
+        _sync(id);          // snapshot "final" accrued for audit
+        c.revoked = true;   // dead forever
         emit ChannelRevoked(id);
     }
 
     /// @notice Update streaming rate / cap for a still-live channel.
-    /// @dev We sync first so accrued reflects earnings up to this point
-    ///      under the OLD rate. Then we overwrite rate/maxBalance and emit.
+    ///
+    /// @param id                Channel identifier.
+    /// @param newRatePerSecond  New accrual rate.
+    /// @param newMaxBalance     New accrual buffer cap.
+    ///
+    /// @dev
+    /// - We _sync first so `accrued` reflects earnings at the OLD rate,
+    ///   then update to the NEW rate.
+    /// - Emits ChannelRateUpdated with both old and new values for audit.
     function updateRate(
         bytes32 id,
         uint256 newRatePerSecond,
@@ -324,9 +387,9 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     ) external onlyGrantor(id) {
         require(newRatePerSecond > 0 && newMaxBalance > 0, "BAD_PARAMS");
 
-        _sync(id);
-
         Channel storage c = channels[id];
+
+        _sync(id);
 
         uint256 oldRate = c.ratePerSecond;
         uint256 oldCap  = c.maxBalance;
@@ -347,9 +410,9 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     // Views
     // -----------------------------------------------------------------------
 
-    /// @notice Pure view of how much is currently claimable, *as if* we synced now,
+    /// @notice View how much is currently claimable, *as if* we synced now,
     ///         without mutating state.
-    /// @dev Routers / dashboards / Mesh call this.
+    /// @dev Routers / dashboards / SettlementMesh call this.
     function claimable(bytes32 id) external view returns (uint256) {
         Channel storage c = channels[id];
 
