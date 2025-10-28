@@ -2,9 +2,9 @@
 pragma solidity ^0.8.20;
 
 /// @title PolicyEnforcer — RIP-007 hardened reference (final)
-/// @notice Enforces spend ceilings, per-epoch budgets, and receiver allowlists.
-/// @dev This contract is meant to sit in front of FlowChannelHardened.pull()
-/// or any router that moves funds on behalf of an institution/CFO/treasury.
+/// @notice Enforces spend ceilings, per-epoch budgets, and receiver allowlists
+/// @dev Sits in front of FlowChannelHardened.pull() or routers.
+///      Pure accounting layer; never holds tokens.
 contract PolicyEnforcer {
     struct Policy {
         address grantor;
@@ -12,7 +12,7 @@ contract PolicyEnforcer {
         address token;
 
         uint256 maxPerPull;     // ceiling for a single transfer
-        uint256 maxPerEpoch;    // ceiling for a rolling epoch window
+        uint256 maxPerEpoch;    // ceiling for an epoch window
         uint256 epochLength;    // seconds per epoch bucket
 
         bool hasReceiverRules;
@@ -37,8 +37,6 @@ contract PolicyEnforcer {
 
     event ReceiverAllowed(bytes32 indexed policyId, address receiver, bool allowed);
     event PolicyRevoked(bytes32 indexed policyId, address indexed grantor);
-
-    // emitted every time budget is consumed
     event PolicySpend(
         bytes32 indexed policyId,
         uint64 indexed epochId,
@@ -46,10 +44,25 @@ contract PolicyEnforcer {
         uint256 newEpochTotal
     );
 
+    /// -----------------------------------------------------------------------
+    /// Simple local reentrancy guard
+    /// -----------------------------------------------------------------------
+    uint256 private _status = 1;
+    modifier nonReentrant() {
+        require(_status == 1, "REENTRANCY");
+        _status = 2;
+        _;
+        _status = 1;
+    }
+
     modifier onlyGrantor(bytes32 policyId) {
-        require(msg.sender == policies[policyId].grantor, "not grantor");
+        require(msg.sender == policies[policyId].grantor, "NOT_GRANTOR");
         _;
     }
+
+    /// -----------------------------------------------------------------------
+    /// Policy lifecycle
+    /// -----------------------------------------------------------------------
 
     function createPolicy(
         bytes32 policyId,
@@ -58,12 +71,12 @@ contract PolicyEnforcer {
         uint256 maxPerPull,
         uint256 maxPerEpoch,
         uint256 epochLength
-    ) external {
+    ) external nonReentrant {
         Policy storage p = policies[policyId];
-        require(p.grantor == address(0), "exists");
-        require(grantee != address(0), "bad grantee");
-        require(token != address(0), "bad token");
-        require(epochLength > 0, "epoch=0");
+        require(p.grantor == address(0), "EXISTS");
+        require(grantee != address(0) && token != address(0), "BAD_ADDR");
+        require(epochLength > 0, "EPOCH=0");
+        require(maxPerPull <= maxPerEpoch, "BAD_LIMITS");
 
         p.grantor = msg.sender;
         p.grantee = grantee;
@@ -71,52 +84,66 @@ contract PolicyEnforcer {
         p.maxPerPull = maxPerPull;
         p.maxPerEpoch = maxPerEpoch;
         p.epochLength = epochLength;
-        p.currentEpoch = _epochIndex(p.epochLength);
-        p.spentThisEpoch = 0;
-        p.revoked = false;
-        p.hasReceiverRules = false;
+        p.currentEpoch = _epochIndex(epochLength);
 
         emit PolicyCreated(policyId, msg.sender, grantee, token, maxPerPull, maxPerEpoch, epochLength);
     }
 
-    function setReceiverAllowed(bytes32 policyId, address receiver, bool allowed) external onlyGrantor(policyId) {
+    function setReceiverAllowed(
+        bytes32 policyId,
+        address receiver,
+        bool allowed
+    ) external onlyGrantor(policyId) nonReentrant {
         Policy storage p = policies[policyId];
         p.allowedReceivers[receiver] = allowed;
         p.hasReceiverRules = true;
         emit ReceiverAllowed(policyId, receiver, allowed);
     }
 
-    function revokePolicy(bytes32 policyId) external onlyGrantor(policyId) {
+    function revokePolicy(bytes32 policyId) external onlyGrantor(policyId) nonReentrant {
         policies[policyId].revoked = true;
         emit PolicyRevoked(policyId, msg.sender);
     }
 
-    /// @notice Called by FlowChannelHardened (or router) before releasing funds.
-    /// Consumes budget if allowed.
-    function checkAndConsume(bytes32 policyId, address caller, address to, uint256 amount) external {
+    /// -----------------------------------------------------------------------
+    /// Enforcement entrypoint (called by FlowChannelHardened / routers)
+    /// -----------------------------------------------------------------------
+
+    /// @notice Called before releasing funds; reverts if violation.
+    /// @dev Consumes epoch budget if successful.
+    function checkAndConsume(
+        bytes32 policyId,
+        address caller,
+        address to,
+        uint256 amount
+    ) external nonReentrant {
         Policy storage p = policies[policyId];
 
-        require(!p.revoked, "policy revoked");
-        require(caller == p.grantee, "unauthorized grantee");
-        require(amount <= p.maxPerPull, "exceeds maxPerPull");
+        require(!p.revoked, "POLICY_REVOKED");
+        require(caller == p.grantee, "UNAUTHORIZED_GRANTEE");
+        require(amount <= p.maxPerPull, "EXCEEDS_PULL");
 
-        // roll epoch window if needed
+        // roll epoch if window has advanced
         uint64 nowEpoch = _epochIndex(p.epochLength);
         if (nowEpoch != p.currentEpoch) {
             p.currentEpoch = nowEpoch;
             p.spentThisEpoch = 0;
         }
 
-        require(p.spentThisEpoch + amount <= p.maxPerEpoch, "exceeds epoch cap");
+        require(p.spentThisEpoch + amount <= p.maxPerEpoch, "EXCEEDS_EPOCH");
 
         if (p.hasReceiverRules) {
-            require(p.allowedReceivers[to], "receiver not allowed");
+            require(p.allowedReceivers[to], "RECEIVER_FORBIDDEN");
         }
 
         p.spentThisEpoch += amount;
 
         emit PolicySpend(policyId, nowEpoch, amount, p.spentThisEpoch);
     }
+
+    /// -----------------------------------------------------------------------
+    /// Views
+    /// -----------------------------------------------------------------------
 
     function viewPolicy(bytes32 policyId) external view returns (
         address grantor,
@@ -143,6 +170,10 @@ contract PolicyEnforcer {
             p.revoked,
             p.hasReceiverRules
         );
+    }
+
+    function isReceiverAllowed(bytes32 policyId, address receiver) external view returns (bool) {
+        return policies[policyId].allowedReceivers[receiver];
     }
 
     function _epochIndex(uint256 epochLength) internal view returns (uint64) {
