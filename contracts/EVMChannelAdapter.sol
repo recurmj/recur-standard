@@ -12,7 +12,7 @@ pragma solidity ^0.8.20;
 ///     • a FlowChannelHardened contract
 ///     • a specific channelId inside that contract
 ///
-/// - CrossNetworkRebalancer calls executeAuthorizedPull() on THIS adapter,
+/// - CrossNetworkRebalancer (RIP-004) calls executeAuthorizedPull() on THIS adapter,
 ///   telling it:
 ///     (grantor, token, finalReceiver, amount)
 ///
@@ -20,16 +20,19 @@ pragma solidity ^0.8.20;
 ///     • the channel is active (not paused / not revoked)
 ///     • the grantor matches the channel's recorded grantor
 ///     • the token matches the channel's recorded token
-///     • msg.sender == channel.grantee (i.e. only the approved executor
-///       for this channel can actually trigger the pull)
+///     • msg.sender == channel.grantee
+///       (i.e. only the approved executor for this channel can actually trigger the pull)
 ///
-/// - Then we call channel.pull(channelId, finalReceiver, amount).
+/// - Then we call FlowChannelHardened.pull(channelId, finalReceiver, amount).
 ///
 /// Security assumptions:
 /// - FlowChannelHardened enforces ratePerSecond, maxBalance, policy, etc.
-/// - The grantor can pause or revoke the channel at any time,
+/// - The grantor can pause() or revoke() the channel at any time,
 ///   which instantly halts movement.
-/// - This adapter is effectively a thin "permission gate" + forwarder.
+/// - Typical deployment wires this adapter + channel into DomainDirectory,
+///   and sets channel.grantee = CrossNetworkRebalancer (or a governance-safe).
+///
+/// This adapter is effectively a thin "permission gate" + forwarder.
 interface IFlowChannelHardened {
     function pull(bytes32 id, address to, uint256 amount) external;
 
@@ -69,12 +72,12 @@ contract EVMChannelAdapter {
     /// - `grantor` and `token` are provided by the caller (CrossNetworkRebalancer),
     ///   but we RE-VERIFY them directly against channel storage for safety.
     /// - We ALSO enforce that msg.sender == channel.grantee. This prevents
-    ///   random addresses from abusing the adapter, and cleanly lets you
-    ///   set channel.grantee = CrossNetworkRebalancer.
+    ///   arbitrary callers from abusing the adapter, and cleanly lets you
+    ///   set channel.grantee = CrossNetworkRebalancer (or governance Safe).
     ///
     /// - If the channel is paused or revoked, we revert.
     /// - If FlowChannelHardened.pull() internally reverts due to rate caps,
-    ///   maxBalance, policy, etc., we bubble that up.
+    ///   maxBalance, or PolicyEnforcer, we bubble that up.
     ///
     /// @param grantor        The expected source-of-funds wallet for this channel.
     /// @param token          The ERC-20 asset we're expecting this channel to stream.
@@ -86,6 +89,9 @@ contract EVMChannelAdapter {
         address finalReceiver,
         uint256 amount
     ) external {
+        require(finalReceiver != address(0), "BAD_RECEIVER");
+        require(amount > 0, "AMOUNT_0");
+
         (
             address chGrantor,
             address chGrantee,
@@ -105,11 +111,11 @@ contract EVMChannelAdapter {
         require(token   == chToken,   "TOKEN_MISMATCH");
 
         // Only the address recorded as channel.grantee is allowed to trigger this.
-        // Typical pattern: channel.grantee = CrossNetworkRebalancer.
+        // Typical pattern: channel.grantee = CrossNetworkRebalancer (or a Safe it controls).
         require(msg.sender == chGrantee, "NOT_CHANNEL_GRANTEE");
 
-        // This call moves funds directly from the channel's tracked grantor
-        // to `finalReceiver`. This adapter never holds funds.
+        // This moves funds directly from the channel's tracked grantor
+        // to `finalReceiver`. Adapter never holds funds.
         flow.pull(channelId, finalReceiver, amount);
     }
 }
