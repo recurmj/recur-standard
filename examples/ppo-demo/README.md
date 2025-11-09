@@ -31,7 +31,7 @@ You need:
 ### 1. Clone & install
 
 ~~~
-git clone https://github.com/recurlabs/recur-standard.git
+git clone https://github.com/recurmj/recur-standard.git
 cd recur-standard/examples/ppo-demo
 forge install   # installs deps if not done globally
 ~~~
