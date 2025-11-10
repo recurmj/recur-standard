@@ -1,14 +1,17 @@
-#!/usr/bin/env bash
-set -euo pipefail
+# examples/ppo-crosschain-demo/scripts/utils.sh
 
 must() {
-  local name="$1"
-  if [[ -z "${!name:-}" ]]; then
-    echo "Missing env var: $name" >&2
-    exit 1
-  fi
+  local var="$1"
+  [[ -n "${!var:-}" ]] || { echo "Missing env: $var"; exit 1; }
 }
 
 addr_from_pk() {
-  cast wallet address --private-key "$PRIVATE_KEY"
+  local pk="${1:-$PRIVATE_KEY}"
+  cast wallet address --private-key "$pk"
+}
+
+save_kv() {
+  # save_kv <file> <KEY> <VALUE>
+  local file="$1" key="$2" val="$3"
+  echo "${key}=${val}" >> "$file"
 }
