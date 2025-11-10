@@ -170,5 +170,5 @@ Next steps (optional):
 You’ve just executed the first live Recur PPO — the foundation of the permissioned-pull standard.
 Everything above runs in under 15 minutes with test ETH.
 
-— **Recur Labs**
+— **Recur Labs**  
 *Defining the permissioned-pull standard for digital value.*
