@@ -13,11 +13,14 @@ pragma solidity ^0.8.20;
 ///
 /// SECURITY MODEL:
 /// - We bind each `authHash` to an `owner` (the grantor) the first time we ever
-///   see a real pull recorded for that authHash. After that, ONLY that owner
-///   can revoke() future use of the authHash.
+///   see a real pull recorded for that authHash, or when governance explicitly
+///   sets / corrects the owner via `correctAuthOwner()`.
+///   After that, ONLY that owner can revoke() future use of the authHash.
 /// - `recordPull()` is **restricted to trusted executors** (e.g. RecurPullSafeV2,
 ///   CrossNetworkRebalancer, etc.). Governance (controller) manages that allowlist.
 ///   This prevents griefers from spoofing pulls, stealing ownership, or polluting totals.
+/// - If a trusted executor is ever misconfigured or compromised and incorrectly
+///   binds an owner, governance can correct the binding via `correctAuthOwner()`.
 ///
 /// - This registry never moves funds; it only records state.
 ///
@@ -41,11 +44,15 @@ contract RecurConsentRegistry {
 
     // authHash => canonical grantor (the party who gave consent)
     //
-    // We set this once, the FIRST time recordPull() is called for that authHash.
+    // We set this once, either:
+    //  - on the first recordPull() call for that authHash, OR
+    //  - when governance explicitly sets / corrects it via correctAuthOwner().
+    //
     // After set, only this address may revoke() or setCap() for that authHash.
     mapping(bytes32 => address) public ownerOfAuth;
 
     // controller (Safe / governance multisig) that curates `trustedExecutor`.
+    // Also empowered to correct mis-bound owners via correctAuthOwner().
     address public controller;
 
     // executor address => allowed to call recordPull()
@@ -92,8 +99,18 @@ contract RecurConsentRegistry {
         address token
     );
 
+    /// @notice Emitted when controller is rotated.
     event ControllerUpdated(address indexed newController);
+
+    /// @notice Emitted when an executor trust status is updated.
     event ExecutorTrusted(address indexed executor, bool trusted);
+
+    /// @notice Emitted when governance corrects a mis-bound owner.
+    event AuthorizationOwnerCorrected(
+        bytes32 indexed authHash,
+        address indexed oldOwner,
+        address indexed newOwner
+    );
 
     /// -----------------------------------------------------------------------
     /// Modifiers
@@ -118,6 +135,10 @@ contract RecurConsentRegistry {
         controller = initialController;
     }
 
+    /// -----------------------------------------------------------------------
+    /// Governance
+    /// -----------------------------------------------------------------------
+
     /// @notice Governance rotates controller (multisig / Safe).
     function setController(address next) external onlyController {
         require(next != address(0), "BAD_CONTROLLER");
@@ -127,24 +148,43 @@ contract RecurConsentRegistry {
 
     /// @notice Governance updates which executors are allowed to call recordPull().
     function setTrustedExecutor(address exec, bool allowed) external onlyController {
+        require(exec != address(0), "BAD_EXECUTOR");
         trustedExecutor[exec] = allowed;
         emit ExecutorTrusted(exec, allowed);
     }
 
+    /// @notice Governance can correct or set ownerOfAuth[authHash].
+    /// @dev
+    ///  - Used if a compromised or misconfigured executor incorrectly bound ownership.
+    ///  - Can also be used to pre-bind ownership before any pull, if desired.
+    ///  - newOwner may be zero-address to "reset" ownership if desired.
+    function correctAuthOwner(bytes32 authHash, address newOwner) external onlyController {
+        address oldOwner = ownerOfAuth[authHash];
+        ownerOfAuth[authHash] = newOwner;
+
+        emit AuthorizationOwnerCorrected({
+            authHash: authHash,
+            oldOwner: oldOwner,
+            newOwner: newOwner
+        });
+    }
+
     /// -----------------------------------------------------------------------
-    /// Write functions
+    /// Write functions (grantor / executor)
     /// -----------------------------------------------------------------------
 
     /// @notice Grantor revokes consent for this authHash.
     /// @dev
     ///  - Only the bound grantor (ownerOfAuth[authHash]) may revoke.
-    ///  - If the authHash has never been used (no recordPull() yet), there is
-    ///    no ownerOfAuth[authHash] and this will revert with UNKNOWN_AUTH.
+    ///  - If the authHash has never been used (no recordPull() yet) and
+    ///    governance has not pre-set ownerOfAuth[authHash], there is no owner
+    ///    and this will revert with UNKNOWN_AUTH.
     ///  - After revocation, any compliant pull() MUST revert for this authHash.
     function revoke(bytes32 authHash) external {
         address owner = ownerOfAuth[authHash];
         require(owner != address(0), "UNKNOWN_AUTH");
         require(msg.sender == owner, "NOT_GRANTOR");
+        require(!revoked[authHash], "ALREADY_REVOKED");
 
         revoked[authHash] = true;
 
@@ -180,9 +220,11 @@ contract RecurConsentRegistry {
     ///    (grantor -> grantee) has succeeded in the executor contract.
     ///
     /// Effects:
+    ///  - Reverts if the Authorization has been revoked.
     ///  - Increments totalPulled[authHash].
-    ///  - If first-ever pull for `authHash`, permanently binds that hash to `grantor`
-    ///    as ownerOfAuth[authHash], which controls future revoke() and setCap().
+    ///  - If first-ever pull for `authHash` and no owner was pre-set by
+    ///    governance, permanently binds that hash to `grantor` as
+    ///    ownerOfAuth[authHash], which controls future revoke() and setCap().
     ///
     /// Emits PullExecuted(authHash, token, grantor, grantee, amount, cumulative).
     function recordPull(
@@ -192,9 +234,21 @@ contract RecurConsentRegistry {
         address grantee,
         uint256 amount
     ) external onlyTrustedExecutor {
-        // Bind the canonical owner (grantor) on first use.
-        if (ownerOfAuth[authHash] == address(0)) {
+        require(!revoked[authHash], "AUTH_REVOKED");
+        require(amount > 0, "ZERO_AMOUNT");
+        require(grantor != address(0), "BAD_GRANTOR");
+        require(grantee != address(0), "BAD_GRANTEE");
+        require(token != address(0), "BAD_TOKEN");
+
+        address currentOwner = ownerOfAuth[authHash];
+
+        // If nobody pre-set ownership, bind it to the grantor on first pull.
+        if (currentOwner == address(0)) {
             ownerOfAuth[authHash] = grantor;
+        } else {
+            // Once an owner is set (by a prior pull or governance),
+            // it cannot be changed implicitly via recordPull().
+            require(currentOwner == grantor, "OWNER_MISMATCH");
         }
 
         uint256 newTotal = totalPulled[authHash] + amount;
@@ -252,7 +306,9 @@ contract RecurConsentRegistry {
     }
 
     /// @notice Which address currently controls this authHash's revocation rights.
-    /// @dev Will be zero address until the first successful recordPull() by a trusted executor.
+    /// @dev Will be zero address until:
+    ///      - the first successful recordPull() by a trusted executor, OR
+    ///      - an explicit set / correction via correctAuthOwner().
     function ownerOf(bytes32 authHash) external view returns (address) {
         return ownerOfAuth[authHash];
     }
