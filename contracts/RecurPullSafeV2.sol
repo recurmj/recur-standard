@@ -47,32 +47,27 @@ pragma solidity ^0.8.20;
 /// ------------------------
 /// - The grantor MUST have approved this contract as a spender for `auth.token`:
 ///       IERC20(auth.token).approve(address(this), <limit>);
-///   Otherwise `transferFrom()` will revert with TRANSFER_FAIL.
+///   Otherwise `transferFrom()` will revert.
 /// - The Consent Registry passed to the constructor MUST be trusted infra.
 ///   In production it should:
 ///       * bind authHash -> grantor on first recordPull(),
 ///       * restrict revoke() so only that grantor can revoke,
-///       * ideally restrict recordPull() to known executors (like this contract).
+///       * restrict recordPull() to known executors (like this contract).
 ///
 /// REENTRANCY NOTE
 /// ---------------
 /// - We make one external call to the ERC20 token (transferFrom),
 ///   then one external call to the registry (recordPull()).
-/// - `recordPull()` in a hardened deployment should be a trusted registry that
-///   does not call back into this contract. With that assumption, a explicit
-///   reentrancy guard isn't strictly required here.
-/// - If you plug in an untrusted registry, you are doing it wrong.
+/// - A standard deployment uses a trusted registry that does not reenter.
+///   We still add a nonReentrant guard on pull() to protect against
+///   malicious tokens or misconfigured registries.
 
-/// @notice Minimal ERC-20 interface for pull-based transfers.
-interface IERC20 {
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-}
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @notice Light interface to the Consent Registry (RIP-002).
 /// The registry is the global source of truth for revocation and cumulative accounting.
-/// In hardened deployments:
-///  - recordPull() is only callable by trusted executors,
-///  - revoke() is only callable by the canonical grantor bound to that authHash.
 interface IRecurConsentRegistry {
     function isRevoked(bytes32 authHash) external view returns (bool);
 
@@ -92,7 +87,9 @@ interface IEIP1271 {
     function isValidSignature(bytes32 _hash, bytes calldata _signature) external view returns (bytes4 magicValue);
 }
 
-contract RecurPullSafeV2 {
+contract RecurPullSafeV2 is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     /// -----------------------------------------------------------------------
     /// Authorization struct
     /// -----------------------------------------------------------------------
@@ -144,6 +141,13 @@ contract RecurPullSafeV2 {
         uint256 amount
     );
 
+    /// @notice Emitted when an EIP-1271 wallet call reverts or returns malformed data.
+    event EIP1271ValidationError(
+        address indexed wallet,
+        bytes32 indexed digest,
+        bytes data
+    );
+
     /// -----------------------------------------------------------------------
     /// Constructor
     /// -----------------------------------------------------------------------
@@ -151,6 +155,7 @@ contract RecurPullSafeV2 {
     /// @param registryAddr Address of the deployed Consent Registry (RIP-002)
     ///        for this chain. MUST be trusted infra for revocation + accounting.
     constructor(address registryAddr) {
+        require(registryAddr != address(0), "BAD_REGISTRY");
         registry = IRecurConsentRegistry(registryAddr);
 
         _DOMAIN_SEPARATOR = keccak256(
@@ -206,7 +211,9 @@ contract RecurPullSafeV2 {
     ///   - authHash is revoked in the Consent Registry,
     ///   - msg.sender != auth.grantee,
     ///   - block.timestamp outside [validAfter, validBefore],
+    ///   - amount == 0,
     ///   - amount > maxPerPull,
+    ///   - grantor, grantee or token are zero address,
     ///   - signature is not valid for `auth.grantor`,
     ///   - transferFrom(grantor -> grantee) fails (eg no allowance).
     ///
@@ -221,7 +228,13 @@ contract RecurPullSafeV2 {
     function pull(
         Authorization calldata auth,
         uint256 amount
-    ) external {
+    ) external nonReentrant {
+        // Cheap sanity checks first
+        require(amount > 0, "AMOUNT_0");
+        require(auth.grantor != address(0), "BAD_GRANTOR");
+        require(auth.grantee != address(0), "BAD_GRANTEE");
+        require(auth.token != address(0), "BAD_TOKEN");
+
         // 1. Canonical hash for registry lookups / audit trail
         bytes32 authHash = authHashOf(auth);
 
@@ -237,17 +250,13 @@ contract RecurPullSafeV2 {
 
         // 5. Enforce per-call ceiling
         require(amount <= auth.maxPerPull, "LIMIT");
-        require(amount > 0, "AMOUNT_0");
 
         // 6. Verify the grantor actually signed this Authorization
         require(_verifyGrantorSig(auth, auth.signature), "BAD_SIG");
 
         // 7. Direct, non-custodial transfer grantor -> grantee
         //    NOTE: This requires ERC20 allowance from grantor to this contract.
-        require(
-            IERC20(auth.token).transferFrom(auth.grantor, auth.grantee, amount),
-            "TRANSFER_FAIL"
-        );
+        IERC20(auth.token).safeTransferFrom(auth.grantor, auth.grantee, amount);
 
         // 8. Emit local event (useful for explorers / debugging / monitoring)
         emit PullExecutedDirect(
@@ -308,12 +317,32 @@ contract RecurPullSafeV2 {
 
         // Smart contract wallet path (EIP-1271)
         if (auth.grantor.code.length != 0) {
-            try IEIP1271(auth.grantor).isValidSignature(digest, signature) returns (bytes4 magicVal) {
-                // bytes4(keccak256("isValidSignature(bytes32,bytes)")) == 0x1626ba7e
-                return (magicVal == 0x1626ba7e);
-            } catch {
+            // Use low-level staticcall so we can emit debug info on failure
+            (bool ok, bytes memory returndata) =
+                auth.grantor.staticcall(
+                    abi.encodeWithSelector(
+                        IEIP1271.isValidSignature.selector,
+                        digest,
+                        signature
+                    )
+                );
+
+            if (!ok) {
+                // Wallet reverted for some reason other than "invalid signature".
+                // Emit diagnostic event and treat as invalid.
+                emit EIP1271ValidationError(auth.grantor, digest, returndata);
                 return false;
             }
+
+            if (returndata.length != 32) {
+                // Malformed return data from wallet.
+                emit EIP1271ValidationError(auth.grantor, digest, returndata);
+                return false;
+            }
+
+            bytes4 magicVal = abi.decode(returndata, (bytes4));
+            // bytes4(keccak256("isValidSignature(bytes32,bytes)")) == 0x1626ba7e
+            return (magicVal == 0x1626ba7e);
         }
 
         // EOA path (ECDSA, low-s enforced)
