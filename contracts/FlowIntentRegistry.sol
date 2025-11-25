@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
 /// @title FlowIntentRegistry
 /// @notice RIP-003 registry. Verifies, accounts, and revokes cross-domain FlowIntents.
-/// @custom:version 1.0.1-hardened
+/// @custom:version 1.1.0-hardened
 /// @custom:author Recur Labs
 ///
 /// A FlowIntent says:
@@ -19,18 +21,20 @@ pragma solidity ^0.8.20;
 ///       - the grantor's signature
 ///       - amountToMove for this step
 ///    We:
+///       - check basic struct sanity
 ///       - check signature (EOA or 1271 smart wallet)
 ///       - check time window
 ///       - check revocation
 ///       - enforce cumulative cap (movedSoFar + amountToMove <= maxTotal)
 ///       - bind revocation authority to the grantor
-///       - increment movedSoFar
+///       - increment movedSoFar and emit IntentConsumed
 ///
 /// 3. If we didn't revert, CrossNetworkRebalancer is cleared to actually
 ///    execute the movement via permissioned pull. Funds NEVER touch this contract.
 ///
-/// 4. The grantor can revoke a specific intentHash at any time. After revoke,
-///    verifyAndConsume() will always revert for that intent.
+/// 4. The grantor can revoke a specific intentHash at any time via:
+///       - revokeIntent(intentHash)  (hash-based, once intent is known to registry)
+///       - revokeByPreimage(FlowIntent) (preimage-based, even before first consume)
 ///
 /// Security model
 /// --------------
@@ -38,8 +42,8 @@ pragma solidity ^0.8.20;
 /// - ONLY the configured `controller` can consume budget. That prevents
 ///   grief where an attacker front-runs with the signed intent and burns the
 ///   allowance before the real executor uses it.
-/// - We bind each intentHash to its grantor (ownerOfIntent) on first success,
-///   so only that wallet can later revoke.
+/// - We bind each intentHash to its grantor (ownerOfIntent) on first success
+///   or first explicit revokeByPreimage(), so only that wallet can later revoke.
 /// - We do NOT route or pull funds here. That's RIP-004.
 ///
 /// Executor enforcement
@@ -92,7 +96,7 @@ library ECDSARecover {
     }
 }
 
-contract FlowIntentRegistry {
+contract FlowIntentRegistry is ReentrancyGuard {
     /// -----------------------------------------------------------------------
     /// Data types
     /// -----------------------------------------------------------------------
@@ -140,6 +144,15 @@ contract FlowIntentRegistry {
     /// @notice Emitted when controller authority rotates.
     event ControllerUpdated(address indexed newController);
 
+    /// @notice Emitted whenever budget is successfully consumed for an intent.
+    event IntentConsumed(
+        bytes32 indexed intentHash,
+        address indexed grantor,
+        address indexed executor,
+        uint256 amount,
+        uint256 newMoved
+    );
+
     /// -----------------------------------------------------------------------
     /// Modifiers
     /// -----------------------------------------------------------------------
@@ -167,6 +180,7 @@ contract FlowIntentRegistry {
         address initialController
     ) {
         require(initialController != address(0), "BAD_CONTROLLER");
+        require(_isContract(initialController), "CONTROLLER_NOT_CONTRACT");
 
         controller = initialController;
 
@@ -184,8 +198,11 @@ contract FlowIntentRegistry {
     }
 
     /// @notice Rotate controller (e.g. upgrade to a new CrossNetworkRebalancer).
+    /// @dev Enforces that the new controller is a contract.
     function setController(address next) external onlyController {
         require(next != address(0), "BAD_CONTROLLER");
+        require(_isContract(next), "CONTROLLER_NOT_CONTRACT");
+
         controller = next;
         emit ControllerUpdated(next);
     }
@@ -195,6 +212,7 @@ contract FlowIntentRegistry {
     /// -----------------------------------------------------------------------
 
     /// @notice Hash just the FlowIntent struct fields (no domain separator).
+    /// @dev This must match the EIP-712 struct encoding used off-chain.
     function _hashIntent(FlowIntent calldata i) internal pure returns (bytes32) {
         return keccak256(
             abi.encode(
@@ -213,7 +231,8 @@ contract FlowIntentRegistry {
         );
     }
 
-    /// @notice Full EIP-712 digest = keccak256("\x19\x01", DOMAIN_SEPARATOR, structHash)
+    /// @notice Full EIP-712 digest = keccak256("\x19\x01", DOMAIN_SEPARATOR, structHash).
+    /// @dev This is the exact value that must be signed by the grantor.
     function _digest(FlowIntent calldata i) internal view returns (bytes32) {
         bytes32 structHash = _hashIntent(i);
         return keccak256(
@@ -221,6 +240,7 @@ contract FlowIntentRegistry {
         );
     }
 
+    /// @notice Minimal code-size check for contract detection.
     function _isContract(address a) internal view returns (bool) {
         return a.code.length > 0;
     }
@@ -234,31 +254,39 @@ contract FlowIntentRegistry {
     ///
     /// @dev onlyController:
     ///  - prevents grief where a random caller front-runs and burns down the cap
-    ///    by calling verifyAndConsume() with the grantor's signature
+    ///    by calling verifyAndConsume() with the grantor's signature.
     ///
     /// Enforces:
+    ///  - basic struct sanity (nonzero grantor / executor / token, valid window)
     ///  - current time within [validAfter, validBefore]
     ///  - not revoked
     ///  - signature belongs to `i.grantor` (EOA or EIP-1271 smart wallet)
     ///  - movedSoFar[intentHash] + amountToMove <= maxTotal
     ///  - ownerOfIntent[intentHash] is bound to the grantor on first success
+    ///  - emits IntentConsumed(intentHash, grantor, executor, amount, newMoved)
     function verifyAndConsume(
         FlowIntent calldata i,
         bytes calldata signature,
         uint256 amountToMove
-    ) external onlyController returns (bytes32 intentHash) {
+    ) external onlyController nonReentrant returns (bytes32 intentHash) {
+        // Basic sanity first for clear error messages and cheaper early failures.
         require(amountToMove > 0, "AMOUNT_0");
+        require(i.grantor != address(0), "BAD_GRANTOR");
+        require(i.executor != address(0), "BAD_EXECUTOR");
+        require(i.token != address(0), "BAD_TOKEN");
+        require(i.validBefore > i.validAfter, "BAD_WINDOW");
+
         require(block.timestamp >= i.validAfter, "NOT_YET_VALID");
         require(block.timestamp <= i.validBefore, "EXPIRED");
 
         intentHash = _hashIntent(i);
         require(!revoked[intentHash], "REVOKED");
 
-        // Enforce cumulative cap
+        // Enforce cumulative cap.
         uint256 newMoved = movedSoFar[intentHash] + amountToMove;
         require(newMoved <= i.maxTotal, "CAP_EXCEEDED");
 
-        // Verify signature from grantor (EIP-712)
+        // Verify signature from grantor (EIP-712).
         bytes32 dig = _digest(i);
 
         if (_isContract(i.grantor)) {
@@ -278,19 +306,44 @@ contract FlowIntentRegistry {
 
         // Reserve consumption so future calls can't exceed maxTotal.
         movedSoFar[intentHash] = newMoved;
+
+        // Emit observability event for dashboards / explorers / telemetry.
+        emit IntentConsumed(intentHash, i.grantor, i.executor, amountToMove, newMoved);
     }
 
     /// -----------------------------------------------------------------------
     /// Revocation
     /// -----------------------------------------------------------------------
 
-    /// @notice Revoke a FlowIntent permanently.
+    /// @notice Revoke a FlowIntent permanently by intent hash.
     /// @dev Only the bound grantor can revoke.
     ///      After revocation, verifyAndConsume() will always revert for this hash.
     function revokeIntent(bytes32 intentHash) external {
         address owner = ownerOfIntent[intentHash];
         require(owner != address(0), "UNKNOWN_INTENT");
         require(msg.sender == owner, "NOT_OWNER");
+
+        revoked[intentHash] = true;
+        emit IntentRevoked(intentHash, msg.sender);
+    }
+
+    /// @notice Revoke a FlowIntent permanently by its full preimage.
+    /// @dev This allows:
+    ///      - revoking *before* first consumption, or
+    ///      - revoking even if the intentHash is not yet known to the caller.
+    ///      If ownerOfIntent[intentHash] is unset, it will be bound to i.grantor.
+    function revokeByPreimage(FlowIntent calldata i) external {
+        require(msg.sender == i.grantor, "NOT_GRANTOR");
+
+        bytes32 intentHash = _hashIntent(i);
+        address owner = ownerOfIntent[intentHash];
+
+        if (owner == address(0)) {
+            // Bind revocation ownership on first preimage revoke.
+            ownerOfIntent[intentHash] = i.grantor;
+        } else {
+            require(owner == i.grantor, "NOT_OWNER");
+        }
 
         revoked[intentHash] = true;
         emit IntentRevoked(intentHash, msg.sender);
