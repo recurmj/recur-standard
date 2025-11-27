@@ -19,7 +19,7 @@ pragma solidity ^0.8.20;
 ///     ERC20(token).transferFrom(grantor, to, amount)
 ///   during pull().
 ///   => The grantor must have given this contract sufficient allowance,
-///      or pull() will revert with TRANSFER_FAIL.
+///      or pull() will revert.
 /// - pause() and revoke() are instant kill switches:
 ///     * paused  => accrual stops *and* pull() reverts, but can later resume().
 ///     * revoked => accrual frozen forever; pull() will always revert.
@@ -28,9 +28,8 @@ pragma solidity ^0.8.20;
 ///   so they can orchestrate rebalancing without custody.
 ///
 /// Accounting model:
-/// - Accrual math is deterministic:
-///     accrued += ratePerSecond * dt
-///     capped at maxBalance
+/// - Accrual math is deterministic and saturating:
+///     accrued' = min(maxBalance, accrued + ratePerSecond * dt)
 /// - _sync() is called before any state mutation that depends on up-to-date accrual.
 /// - claimable() simulates that same math in view-only mode without mutating.
 ///
@@ -39,9 +38,9 @@ pragma solidity ^0.8.20;
 ///   with a buffer cap of B".
 /// - AdaptiveRouter decides *which* channel to drain and *where* to send the funds (`to`).
 /// - PolicyEnforcer can enforce spend ceilings per epoch, receiver allowlists, etc.
-interface ITrackedERC20 {
-    function transferFrom(address from, address to, uint256 value) external returns (bool);
-}
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 interface IPolicyEnforcer {
     /// @notice MUST revert if this pull should not be allowed.
@@ -70,6 +69,8 @@ abstract contract ReentrancyGuardFC {
 }
 
 contract FlowChannelHardened is ReentrancyGuardFC {
+    using SafeERC20 for IERC20;
+
     struct Channel {
         address grantor;          // who ultimately pays
         address grantee;          // who is authorized to call pull()
@@ -145,31 +146,6 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     // Channel lifecycle
     // -----------------------------------------------------------------------
 
-    /// @notice Create a new streaming channel.
-    /// @param id              Chosen channel identifier (must be unique).
-    /// @param grantee         Address allowed to call pull() / spend the stream.
-    /// @param token           ERC-20 being streamed.
-    /// @param ratePerSecond   Tokens per second that accrue.
-    /// @param maxBalance      Maximum unclaimed buffer before accrual stops.
-    /// @param policyEnforcer  Optional policy module (address(0) = none).
-    /// @param policyId        Policy identifier for that enforcer.
-    ///
-    /// @dev
-    /// NON-CUSTODIAL CONSENT MODEL:
-    /// - This contract NEVER escrows tokens.
-    /// - pull() calls token.transferFrom(grantor -> receiver).
-    /// - Therefore the grantor MUST have given this contract sufficient ERC20 allowance
-    ///   (via token.approve(address(this), amount)) before any pull can succeed.
-    /// - If allowance is missing or too low, pull() will revert with TRANSFER_FAIL.
-    ///
-    /// SAFETY:
-    /// - The grantor can yank or reduce allowance at any time to cut off outflow,
-    ///   even without pausing/revoking the channel.
-    ///
-    /// Requirements:
-    /// - `id` must not already exist.
-    /// - `ratePerSecond` > 0 and `maxBalance` > 0.
-    /// - `grantee` and `token` must be nonzero.
     function openChannel(
         bytes32 id,
         address grantee,
@@ -202,32 +178,62 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     }
 
     // -----------------------------------------------------------------------
-    // Internal accrual logic
+    // Internal accrual logic (saturating, overflow-safe)
     // -----------------------------------------------------------------------
 
     /// @dev Sync a channel's `accrued` balance up to `block.timestamp`.
     ///      Accrual stops immediately if paused or revoked.
+    ///
+    ///      Implementation is saturating:
+    ///      - If accrued is already at maxBalance, we do nothing but bump lastUpdate.
+    ///      - Otherwise we compute the maximum dt before hitting maxBalance as:
+    ///            maxDt = (maxBalance - accrued) / ratePerSecond
+    ///        and either:
+    ///            - set accrued = maxBalance if dt >= maxDt, or
+    ///            - accrued += dt * ratePerSecond (which is safe because dt < maxDt).
     function _sync(bytes32 id) internal {
         Channel storage c = channels[id];
+
+        // Bump timestamp and halt accrual if paused/revoked.
+        if (c.revoked || c.paused) {
+            c.lastUpdate = uint64(block.timestamp);
+            return;
+        }
 
         uint256 dt = block.timestamp - c.lastUpdate;
         if (dt == 0) {
             return;
         }
 
-        // If paused or revoked, accrual halts. Still bump lastUpdate
-        // so dt doesn't accumulate while off.
-        if (c.revoked || c.paused) {
+        // If we've already hit the cap, just update lastUpdate.
+        if (c.accrued >= c.maxBalance) {
+            c.accrued = c.maxBalance;
             c.lastUpdate = uint64(block.timestamp);
             return;
         }
 
-        uint256 newAccrued = c.accrued + (dt * c.ratePerSecond);
-        if (newAccrued > c.maxBalance) {
-            newAccrued = c.maxBalance;
+        // No accrual if rate is zero (defensive; rate should normally > 0).
+        if (c.ratePerSecond == 0) {
+            c.lastUpdate = uint64(block.timestamp);
+            return;
         }
 
-        c.accrued = newAccrued;
+        uint256 remaining = c.maxBalance - c.accrued;
+
+        // Maximum dt we can apply before hitting the cap.
+        uint256 maxDt = remaining / c.ratePerSecond;
+
+        if (maxDt == 0 || dt >= maxDt) {
+            // One more second at this rate would exceed the cap
+            // => saturate to maxBalance.
+            c.accrued = c.maxBalance;
+            c.lastUpdate = uint64(block.timestamp);
+            return;
+        }
+
+        // Here: dt < maxDt, so dt * ratePerSecond < remaining.
+        // This guarantees no overflow and accrued' <= maxBalance.
+        c.accrued = c.accrued + (dt * c.ratePerSecond);
         c.lastUpdate = uint64(block.timestamp);
     }
 
@@ -241,33 +247,6 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     // Pull / spend path
     // -----------------------------------------------------------------------
 
-    /// @notice Grantee withdraws part of the accrued balance to any `to`.
-    /// @param id     Channel identifier.
-    /// @param to     Final receiver of funds on this chain.
-    /// @param amount Amount to pull right now.
-    ///
-    /// @dev
-    /// NON-CUSTODIAL TRANSFER:
-    /// - This contract does NOT hold tokens.
-    /// - It simply calls token.transferFrom(grantor -> to, amount).
-    /// - The grantor MUST maintain ERC20 allowance for this contract or
-    ///   pull() will revert with TRANSFER_FAIL.
-    ///
-    /// EMERGENCY CONTROL:
-    /// - Grantor can pause() (or revoke()) the channel, which halts accrual
-    ///   and makes pull() revert.
-    /// - Grantor can also drop allowance on the ERC20 itself.
-    ///
-    /// Requirements:
-    /// - Caller MUST be the channel's grantee.
-    /// - Channel MUST NOT be paused or revoked.
-    /// - `amount` > 0 and `amount` ≤ claimable() at this instant.
-    /// - `to` cannot be address(0).
-    ///
-    /// Effects on success:
-    /// - `accrued` is reduced.
-    /// - Optional PolicyEnforcer is checked and consumes budget.
-    /// - ERC20 tokens move directly grantor -> `to`.
     function pull(bytes32 id, address to, uint256 amount)
         external
         nonReentrant
@@ -297,11 +276,8 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         // Deduct BEFORE external transferFrom()
         c.accrued -= amount;
 
-        // Non-custodial transfer out of the grantor's balance.
-        require(
-            ITrackedERC20(c.token).transferFrom(c.grantor, to, amount),
-            "TRANSFER_FAIL"
-        );
+        // Non-custodial transfer out of the grantor's balance (SafeERC20).
+        IERC20(c.token).safeTransferFrom(c.grantor, to, amount);
 
         emit Pulled(id, to, amount);
     }
@@ -310,18 +286,6 @@ contract FlowChannelHardened is ReentrancyGuardFC {
     // Grantor controls
     // -----------------------------------------------------------------------
 
-    /// @notice Pause accrual and block pulls (but do not permanently revoke).
-    ///
-    /// @dev
-    /// Behavior:
-    /// - After pause():
-    ///    * accrual stops,
-    ///    * pull() will revert,
-    ///    * channel can later resume().
-    ///
-    /// Implementation detail:
-    /// - We _sync first to snapshot accrued up to "now",
-    ///   THEN mark paused=true.
     function pause(bytes32 id) external onlyGrantor(id) {
         Channel storage c = channels[id];
         _sync(id);          // snapshot first for clean accounting
@@ -329,17 +293,6 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         emit ChannelPaused(id);
     }
 
-    /// @notice Resume accrual and allow pulls again.
-    ///
-    /// @dev
-    /// Behavior:
-    /// - After resume():
-    ///    * accrual restarts from the current timestamp,
-    ///    * pull() is allowed again (unless revoked separately).
-    ///
-    /// Implementation detail:
-    /// - We clear paused AFTER ensuring not revoked,
-    ///   and reset lastUpdate to "now" so accrual restarts cleanly.
     function resume(bytes32 id) external onlyGrantor(id) {
         Channel storage c = channels[id];
         require(!c.revoked, "REVOKED");
@@ -348,21 +301,6 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         emit ChannelResumed(id);
     }
 
-    /// @notice Permanently revoke a channel.
-    ///
-    /// @dev
-    /// Behavior:
-    /// - After revoke():
-    ///    * accrual is frozen forever,
-    ///    * pull() will always revert,
-    ///    * channel cannot be resumed.
-    /// - Any remaining `accrued` is effectively stranded unless you implement
-    ///   an explicit "recover leftovers" path in a custom fork. We intentionally
-    ///   do NOT provide that here — revoke() is an emergency hard kill.
-    ///
-    /// Implementation detail:
-    /// - We _sync first so accrued reflects earnings up to this exact revoke boundary,
-    ///   THEN mark revoked=true.
     function revoke(bytes32 id) external onlyGrantor(id) {
         Channel storage c = channels[id];
         _sync(id);          // snapshot "final" accrued for audit
@@ -370,16 +308,6 @@ contract FlowChannelHardened is ReentrancyGuardFC {
         emit ChannelRevoked(id);
     }
 
-    /// @notice Update streaming rate / cap for a still-live channel.
-    ///
-    /// @param id                Channel identifier.
-    /// @param newRatePerSecond  New accrual rate.
-    /// @param newMaxBalance     New accrual buffer cap.
-    ///
-    /// @dev
-    /// - We _sync first so `accrued` reflects earnings at the OLD rate,
-    ///   then update to the NEW rate.
-    /// - Emits ChannelRateUpdated with both old and new values for audit.
     function updateRate(
         bytes32 id,
         uint256 newRatePerSecond,
@@ -412,20 +340,38 @@ contract FlowChannelHardened is ReentrancyGuardFC {
 
     /// @notice View how much is currently claimable, *as if* we synced now,
     ///         without mutating state.
-    /// @dev Routers / dashboards / SettlementMesh call this.
+    /// @dev Uses the same saturating, overflow-safe accrual logic as _sync().
     function claimable(bytes32 id) external view returns (uint256) {
         Channel storage c = channels[id];
 
-        uint256 projected = c.accrued;
-        uint256 dt = block.timestamp - c.lastUpdate;
-
-        if (!(c.revoked || c.paused)) {
-            projected += dt * c.ratePerSecond;
-            if (projected > c.maxBalance) {
-                projected = c.maxBalance;
-            }
+        // If paused/revoked, no further accrual.
+        if (c.revoked || c.paused) {
+            return c.accrued;
         }
 
-        return projected;
+        // Defensive: if rate is zero, nothing accrues.
+        if (c.ratePerSecond == 0) {
+            return c.accrued;
+        }
+
+        uint256 dt = block.timestamp - c.lastUpdate;
+        if (dt == 0) {
+            return c.accrued;
+        }
+
+        if (c.accrued >= c.maxBalance) {
+            return c.maxBalance;
+        }
+
+        uint256 remaining = c.maxBalance - c.accrued;
+        uint256 maxDt = remaining / c.ratePerSecond;
+
+        if (maxDt == 0 || dt >= maxDt) {
+            return c.maxBalance;
+        }
+
+        // dt < maxDt ⇒ dt * ratePerSecond < remaining ⇒
+        // accrued + dt*ratePerSecond <= maxBalance and cannot overflow.
+        return c.accrued + (dt * c.ratePerSecond);
     }
 }
