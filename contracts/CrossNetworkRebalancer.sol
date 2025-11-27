@@ -41,6 +41,9 @@ pragma solidity ^0.8.20;
 /// CONTROLLER
 /// - `controller` (Safe / governance) can batch or emergency-drive rebalancing
 ///   even if the named executor isn't the direct caller.
+
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
 interface IFlowIntentRegistry {
     struct FlowIntent {
         address grantor;
@@ -124,7 +127,7 @@ struct FlowIntentFull {
     bytes   signature;  // grantor signature over the FlowIntent terms above
 }
 
-contract CrossNetworkRebalancer {
+contract CrossNetworkRebalancer is ReentrancyGuard {
     IFlowIntentRegistry public intents;
     IRecurConsentRegistry public consent;
     IDomainDirectory public directory;
@@ -139,9 +142,17 @@ contract CrossNetworkRebalancer {
         address executor
     );
 
+    /// @notice Emitted when controller authority rotates.
+    event ControllerUpdated(address indexed newController);
+
     modifier onlyController() {
         require(msg.sender == controller, "NOT_CONTROLLER");
         _;
+    }
+
+    /// @notice Minimal code-size check for contract detection.
+    function _isContract(address a) internal view returns (bool) {
+        return a.code.length > 0;
     }
 
     constructor(
@@ -155,6 +166,12 @@ contract CrossNetworkRebalancer {
         require(domainDirectory != address(0), "BAD_DIRECTORY");
         require(initialController != address(0), "BAD_CTRL");
 
+        // Harden: ensure core infra are contracts, not EOAs.
+        require(_isContract(intentRegistry), "INTENT_REG_NOT_CONTRACT");
+        require(_isContract(consentRegistry), "CONSENT_REG_NOT_CONTRACT");
+        require(_isContract(domainDirectory), "DIRECTORY_NOT_CONTRACT");
+        require(_isContract(initialController), "CTRL_NOT_CONTRACT");
+
         intents = IFlowIntentRegistry(intentRegistry);
         consent = IRecurConsentRegistry(consentRegistry);
         directory = IDomainDirectory(domainDirectory);
@@ -162,9 +179,12 @@ contract CrossNetworkRebalancer {
     }
 
     /// @notice Governance can rotate controller (Safe / emergency authority).
+    /// @dev Enforces that the new controller is a contract.
     function setController(address next) external onlyController {
         require(next != address(0), "BAD_CTRL");
+        require(_isContract(next), "CTRL_NOT_CONTRACT");
         controller = next;
+        emit ControllerUpdated(next);
     }
 
     /// @notice Execute a portion of a FlowIntent.
@@ -195,9 +215,10 @@ contract CrossNetworkRebalancer {
         FlowIntentFull calldata intentFull,
         uint256 amount,
         address sourcePullContract
-    ) external returns (bool ok) {
+    ) external nonReentrant returns (bool ok) {
         require(amount > 0, "ZERO_AMOUNT");
         require(sourcePullContract != address(0), "BAD_SOURCE_ADAPTER");
+        require(_isContract(sourcePullContract), "ADAPTER_NOT_CONTRACT");
 
         // ---------------------------------------------------------------------
         // 1. Caller authority + domain approval
