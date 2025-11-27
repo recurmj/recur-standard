@@ -22,7 +22,15 @@ pragma solidity ^0.8.20;
 ///   trusts that value and does not re-check limits itself.
 /// - Router never escrows funds. Movement is always grantor -> `to`.
 ///
+/// GAS / SCALING MODEL
+/// - We bound the total number of channels via MAX_CHANNELS. This keeps the
+///   O(N) scan in routeStep() within safe gas limits and addresses the
+///   audit concern about unbounded iteration.
+///
 /// This contract is intentionally thin. It's a coordinator, not a bank.
+
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
 interface IFlowChannelHardened {
     /// @notice Pull `amount` of already-accrued funds out of channel `id` to `to`.
     /// @dev MUST revert internally if channel is paused, revoked, over policy, etc.
@@ -34,10 +42,15 @@ interface IFlowChannelHardened {
     function claimable(bytes32 id) external view returns (uint256);
 }
 
-contract AdaptiveRouter {
+contract AdaptiveRouter is ReentrancyGuard {
     /// -----------------------------------------------------------------------
-    /// Data
+    /// Constants / Data
     /// -----------------------------------------------------------------------
+
+    /// @notice Hard cap on number of channels this router will track.
+    /// @dev Keeps routeStep() gas-bounded. If more channels are needed, deploy
+    ///      another router instance or shard routing by token/domain.
+    uint256 public constant MAX_CHANNELS = 256;
 
     struct RouteTarget {
         bytes32 channelId; // channel handle understood by FlowChannelHardened
@@ -77,12 +90,17 @@ contract AdaptiveRouter {
     event Routed(bytes32 indexed channelId, address to, uint256 amount);
 
     /// -----------------------------------------------------------------------
-    /// Modifiers
+    /// Modifiers / Utils
     /// -----------------------------------------------------------------------
 
     modifier onlyController() {
         require(msg.sender == controller, "NOT_CONTROLLER");
         _;
+    }
+
+    /// @notice Minimal code-size check for contract detection.
+    function _isContract(address a) internal view returns (bool) {
+        return a.code.length > 0;
     }
 
     /// -----------------------------------------------------------------------
@@ -99,14 +117,18 @@ contract AdaptiveRouter {
     constructor(address flowChannelAddress, address initialController) {
         require(flowChannelAddress != address(0), "BAD_FLOW");
         require(initialController != address(0), "BAD_CTRL");
+        require(_isContract(flowChannelAddress), "FLOW_NOT_CONTRACT");
+        require(_isContract(initialController), "CTRL_NOT_CONTRACT");
 
         flow = IFlowChannelHardened(flowChannelAddress);
         controller = initialController;
     }
 
     /// @notice Rotate controller authority (e.g. change multisig).
+    /// @dev Enforces that the new controller is a contract.
     function setController(address newController) external onlyController {
         require(newController != address(0), "BAD_CTRL");
+        require(_isContract(newController), "CTRL_NOT_CONTRACT");
         controller = newController;
         emit ControllerUpdated(newController);
     }
@@ -118,13 +140,14 @@ contract AdaptiveRouter {
     /// @notice Register a new channel into routing consideration.
     /// @param channelId Opaque channel identifier understood by FlowChannelHardened.
     /// @param weight Higher weight means this channel is preferred in routing.
-    /// @dev Reverts if channel already exists.
+    /// @dev Reverts if channel already exists or if MAX_CHANNELS is reached.
     function registerChannel(bytes32 channelId, uint256 weight)
         external
         onlyController
     {
         require(channelId != bytes32(0), "BAD_ID");
         require(targetFor[channelId].channelId == bytes32(0), "EXISTS");
+        require(channelList.length < MAX_CHANNELS, "MAX_CHANNELS");
 
         channelList.push(channelId);
 
@@ -185,11 +208,16 @@ contract AdaptiveRouter {
     ///   this whole call reverts and no fallback channel is attempted. That
     ///   "loud fail" is deliberate so governance sees the restriction signal
     ///   instead of silently draining a lower-priority source.
+    /// GAS:
+    /// - The scan is O(N) over channelList. MAX_CHANNELS ensures N is bounded
+    ///   and routeStep() remains gas-safe.
     function routeStep(address to, uint256 maxDesired)
         external
         onlyController
+        nonReentrant
     {
         require(to != address(0), "BAD_TO");
+        require(maxDesired > 0, "ZERO_MAX");
 
         // Pick highest-weight active channel.
         bytes32 best;
