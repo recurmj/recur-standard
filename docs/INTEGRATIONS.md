@@ -1,151 +1,139 @@
 
 #  Recur Integrations & Implementations  
-### How Permissioned Pull Primitives Integrate Across Financial Infrastructure  
-**Version 1.0 — October 2025**  
+### Applying Permissioned Pull Primitives Across Financial Systems 
+**Version 1.1 — November 2025**  
 Maintained by **Recur Labs**
 
 ---
 
 ## 1. Purpose  
 
-This brief explains how the Recur permissioned-pull standard can be applied in real-world systems:
+This document explains how the Recur permissioned-pull standard (RIP-001 / RIP-002) can be applied in real-world systems:
 
 - Centralized and decentralized exchanges  
 - Treasuries and payment flows  
 - Wallets and custodians  
 - Compliance and audit frameworks  
 
-It complements the **Technical Paper** (architecture) and **RIP-001** (reference spec).
+It provides practical guidance for developers and system architects implementing **pre-consented pull flows.**
 
 ---
 
 ## 2. The Core Primitive  
 
-Recur introduces the **Pull-Permission Object (PPO)**: a signed data object that defines:
+Recur defines the **Pull-Permission Object (PPO)**: a signed data object specifying:
 
-- *who* can pull  
-- *how much*  
-- *how often*  
-- *for how long*  
+- *Who* can pull value  
+- *Limits* on amount and frequency    
+- *Duration* of authorization  
 
-This object can be revoked or modified at any time.  
-The logic is defined in `RecurPull.sol`, with events and registries described in **RIP-002**.  
 
-When implemented, any system can move value safely **before failure**, not after, by pre-consented flow.
+The PPO can be revoked or modified at any time.  
+The logic is defined in `RecurPullV2.sol`, with events and registries described in **RIP-002**.  
+
+Systems using PPOs can execute **pre-authorized transfers safely**, reducing reactive failures.
 
 ---
 
 ## 3. Implementation Archetypes  
 
-### (a) Exchanges: Continuous Margin & Settlement  
+### (a) Exchanges: Continuous Settlement  
 
-**Problem:**  
-Exchanges liquidate *after* margin breaches, creating cascades.  
+**Challenge:** Exchanges often act after margin breaches, which can trigger cascading liquidations.
 
 **Implementation:**  
-- Traders pre-authorize PPOs to the exchange.  
-- Exchange systems monitor collateral ratios in real time.  
-- When thresholds near limit, the exchange calls `pull()` for partial top-ups.  
-- If user revokes consent, positions close gracefully.  
+- Traders pre-authorize PPOs for margin or collateral flows.  
+- Exchange systems monitor positions and trigger `pull()` calls within consented limits.  
+- Users can revoke or adjust permissions if needed.  
 
-**Impact:**  
-Eliminates forced liquidations and contagion events.  
-Markets rebalance continuously rather than catastrophically.
+**Effect:** Enables controlled, consent-based transfers rather than reactive liquidations.
 
 ---
 
-### (b) DeFi / Treasury Systems: Real-Time Rebalancing  
+### (b) Treasuries & DeFi Systems: Automated Rebalancing
 
-**Problem:**  
-DAO and corporate treasuries rebalance manually or reactively, leaving idle or misallocated capital.  
+**Challenge:** Treasury accounts and liquidity pools are often rebalanced manually, leaving idle or misallocated capital.
 
 **Implementation:**  
-- PPOs define flow parameters between stablecoin pools, lending markets, and custody accounts.  
-- Smart contracts initiate `pull()`s periodically within those permissions.  
-- Surplus drains from low-yield pools → safety buffers; deficits auto-refilled.  
+- PPOs define allowed transfers between pools, contracts, or accounts.  
+- Smart contracts initiate authorized pulls periodically.  
+- Systems adjust balances while remaining within user-defined limits.  
 
 **Impact:**  
 Automates liquidity management without introducing custodial risk.
 
 ---
 
-### (c) Wallets & Custodians: User-Level Consent UX  
+### (c) Wallets & Custodians: User-Level Consent  
 
-**Problem:**  
-Recurring payments or approvals are binary — “approve infinite” or “approve again.”  
+**Challenge:** Recurring approvals are often binary — “approve all” or “approve again.”
 
 **Implementation:**  
-- Wallets display “Active Consents.”  
-- Users set limits: amount, duration, and recipient contract.  
-- Revocation uses on-chain `revoke()`; visual confirmation in wallet UI.  
+- Wallets display active consents with limits, duration, and recipient.  
+- Users can revoke or modify authorizations at any time.  
+- Integrations respect PPOs for all pull operations.  
 
-**Impact:**  
-Brings consumer-grade recurring flows to crypto, with full user control and instant revocation.
+**Effect:** Provides users with granular, revocable control over recurring flows.
 
 ---
 
-### (d) Compliance & Audit Layers: Transparent Authorization Trail  
+### (d) Compliance & Audit: Transparent Authorization  
 
-**Problem:**  
-Traditional AML/compliance frameworks rely on ex-post reporting.  
+**Challenge:** Traditional compliance relies on ex-post reporting.
 
 **Implementation:**  
-- Each PPO emits structured `Authorize`, `Pull`, and `Revoke` events (per RIP-002).  
-- External indexers reconstruct consent history for audit or analytics.  
-- Risk engines track activity without intrusive KYC or custody.  
+- Each PPO emits structured `Authorize`, `Pull`, and `Revoke` events.  
+- Indexers or registries can reconstruct consent history for auditing or analytics.  
+- Risk engines can monitor flows without holding user funds.  
 
-**Impact:**  
-Shifts oversight from surveillance to transparency; consent replaces suspicion.
+**Effect:** Supports auditability and oversight while respecting user consent.
 
 ---
 
-## 4. Developer Pathway  
+## 4. Developer Guidance  
 
-To build on Recur:  
+To integrate Recur PPOs:    
 
-1. Import or extend `RecurPull.sol`.  
-2. Define your **authorization UX** (web3 modal, API, etc.).  
-3. Listen for events per RIP-002.  
+1. Import or extend `RecurPullV2.sol`.  
+2. Implement authorization UX (web3 modal, API, etc.).   
+3. Listen for events according to RIP-002.  
 4. Optionally integrate `RecurRegistry` for discovery & revocation lookups.  
 
-SDKs and example dapps are maintained under `/examples`.
-
-Developers can test against the reference PPO SDK at /sdk/ppo.js and /sdk/registry.js (RIP-002-compatible).
+Reference SDKs: /sdk/ppo.js, /sdk/registry.js.
 
 ---
 
 ## 5. Interoperability  
 
-Recur is **EVM-agnostic** and works on any chain or L2 that supports ERC-20 semantics.  
-It’s also **AA-compatible**, enabling advanced session policies and gasless UX.  
+Recur is **EVM-agnostic** and compatible with any ERC-20-like token standard.
 
-Planned bridges:  
-- Wrapped PPO representation for non-EVM chains (via Wormhole/IBC).  
-- Fiat gateway modules for off-ramp integrations.
+Optional extensions:
+
+- Cross-chain PPO representations (via bridges like Wormhole/IBC)  
+- Off-ramp and fiat integrations  
 
 ---
 
 ## 6. Strategic Impact  
 
-| Layer | Example | Recur Effect |
+| Layer | Example | How PPOs Apply |
 |-------|----------|--------------|
-| **Exchange** | Binance, Coinbase | Continuous margin → fewer cascades |
-| **Treasury** | DAOs, Corporates | Self-balancing reserves |
-| **Wallet** | MetaMask, Safe | Revocable recurring payments |
-| **Compliance** | Chainalysis, Fireblocks | Verifiable consent trail |
+| **Exchange** | Binance, Coinbase | Consent-based margin adjustments |
+| **Treasury** | DAOs, Corporates | Pre-authorized periodic rebalancing |
+| **Wallet** | MetaMask, Safe | Granular recurring transfers |
+| **Compliance** | Chainalysis, Fireblocks | Auditable consent trail |
 
-Recur turns each of these from *reactive systems* into *continuous flow systems.*
 
 ---
 
 ## 7. Summary  
 
-**Recur = Flow Logic for Value.**  
+**Recur = Pre-Authorized Pull Logic.**  
 
-It defines the mechanism that lets liquidity rebalance within consent — across exchanges, treasuries, and wallets — forming the first true continuity layer of digital finance.  
+The specification provides a consistent, verifiable method for executing consented transfers across financial infrastructure, with user revocability and auditability.
 
-This is not a company product; it’s a structural upgrade to how value moves.  
-Recur Labs maintains the open specification and reference implementations under:  
+Reference implementations and SDKs are maintained at:
+
 
  [github.com/recurmj/recur-standard](https://github.com/recurmj/recur-standard)
 
