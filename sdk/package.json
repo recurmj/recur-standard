@@ -4,5 +4,5 @@
   "type": "module",
   "main": "index.js",
   "license": "Apache-2.0",
-  "description": "Minimal helpers for Recur permissioned-pull (RIP-001), registry (RIP-002), and flow intents (RIP-003+)."
+  "description": "Minimal helpers for Recur permissioned-pull (RIP-001) and registry (RIP-002)"
 }
