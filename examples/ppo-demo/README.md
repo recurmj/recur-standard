@@ -1,4 +1,4 @@
-# PPO Demo — Permissioned Pull Object (Recur Standard)
+# PPO Demo: Permissioned Pull Object (Recur Standard)
 
 *The minimal reproducible demo proving value can move by consent, not push.*
 
