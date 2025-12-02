@@ -1,56 +1,39 @@
+# Recur v1.1 — RIP-001 & RIP-002 Audit Summary
 
-# Recur — RIP-001 Reference
-## Informal Audit Summary (October 2025)
-
-This informal audit was conducted by independent reviewers under Recur Labs supervision in October 2025. It does not replace a full formal verification but establishes confidence for public pilot deployments.
-
-Scope: `RecurPull.sol` (primitive), `RecurPullSafeV2.sol` (hardened template)
-
-### Findings (by category)
-
-**Auth & Domain**
-- EIP-712 typed-data with domain separator (name, version, chainId, verifyingContract) — prevents cross-chain/contract replay. ✅
-- Authorization struct includes `nonce` for uniqueness. ✅
-
-**Signature Verification**
-- EOAs via ECDSA `ecrecover`. ✅
-- Smart-contract wallets via EIP-1271 (SafeV2). ✅
-- Digest = `keccak256("\x19\x01", domain, structHash)`. ✅
-
-**Revocation**
-- Primitive: hash-based revoke. ✅ (simple; bind to grantor if desired)
-- SafeV2: revocation requires `auth` and `msg.sender == grantor`. ✅
-
-**Limits / Accounting**
-- Primitive: simple per-call limit by `amount` and time window. ✅
-- SafeV2: cumulative cap via `spent[authHash] + amount <= maxAmount`. ✅
-- Time-window checks: `validAfter ≤ now < validBefore`. ✅
-
-**Token Transfer**
-- Uses `IERC20.transferFrom`. ✅
-- Recommendation: wrap with OZ `SafeERC20` for non-standard tokens. ⚠️
-
-**Reentrancy**
-- Local nonReentrant guard in SafeV2. ✅
-- Single external call to token — low surface.
-
-**Permit Path**
-- SafeV2 optional `pullWithPermit`: calls ERC-2612 `permit()` then `transferFrom`. Validates `value ≥ amount`. ✅
-
-**DoS / Griefing**
-- Revocation and caps mitigate repeated small pulls.
-- Nonce allows unique consents; registry (RIP-002) would aid discovery/UX. ✅
-
-### Recommendations (v1.1 hardening)
-1. Use `SafeERC20` for transfer compatibility edge cases.
-2. Optional per-pull max and min interval (for retail UX).
-3. Permit2 support where available.
-4. Add Foundry tests and fuzz cases (boundary timestamps, signature tamper, revoke race).
-
-### Verdict
-No critical or high-severity issues identified for the intended scope.  
-**SafeV2** is suitable for pilots; the **primitive** is ideal for learning/extending and low-surface audits.
+**Audit:** DEKOJO Technical Review, November 2025  
+**Scope:** RIP-001 (Permissioned Pull) & RIP-002 (Consent Registry)  
+**Version:** v1.1 (stabilized)
 
 ---
 
-© 2025 Recur Labs — Released under CC BY 4.0.
+## Executive Summary
+
+The Recur Standard is a non-custodial, permissioned-pull architecture for consented continuity of value.  
+v1.1 focuses on stabilizing the first two primitives (RIP-001 & RIP-002) for production pilot use.
+
+All **critical and high severity issues** affecting RIP-001 and RIP-002 have been addressed:
+
+- ✅ Race condition on `ownerOfAuth` in `RecurConsentRegistry` resolved
+- ✅ SDK/Contract inconsistencies in `ppo.js` addressed
+- ✅ SafeERC20 wrapper implemented for ERC-20 transfers
+- ✅ Reentrancy guards added or trust assumptions documented
+- ✅ Verification for contract addresses in relevant calls
+- ✅ Overflow checks in per-channel accounting applied
+
+Medium and low issues have been documented for future enhancements but do **not block pilot deployment**.
+
+---
+
+## Status
+
+- RIP-001 & RIP-002: stable and ready for pilot testing  
+- SDK helpers aligned with contract expectations  
+- All audit-critical and high-risk issues resolved
+
+---
+
+**Next Steps:**  
+
+- Begin pilot deployments with test assets  
+- Monitor usage for edge cases and revert scenarios  
+- Proceed to integrate subsequent RIPs (RIP-003 → RIP-008) in future versions
