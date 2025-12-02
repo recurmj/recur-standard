@@ -1,4 +1,4 @@
-# Changelog — v1.1 (December 2025)
+# Changelog v1.1 (December 2025)
 
 ## Updated
 
