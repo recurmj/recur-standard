@@ -111,4 +111,3 @@ No token. No governance coin. This is an open technical standard, not a financia
 v1.1 updates RIP-001 and RIP-002 for technical stability.
 Reference prior work (RIP-001 → RIP-008) as canonical prior art.
 
-Snapshot of v1.1: <>
