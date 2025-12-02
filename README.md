@@ -1,4 +1,4 @@
-# Recur v1.1 — Permissioned Pull Core Stabilization
+# Recur v1.1: Permissioned Pull Core Stabilization
 
 ## Overview
 
@@ -6,8 +6,8 @@ Recur defines the **permissioned-pull standard**: a secure, on-chain method to a
 
 v1.1 stabilizes:
 
-- **RIP-001** — Permissioned Pull primitive  
-- **RIP-002** — Consent Registry (revocation & audit)
+- **RIP-001**: Permissioned Pull primitive  
+- **RIP-002**: Consent Registry (revocation & audit)
 
 These are ready for first production pilot deployments.  
 
