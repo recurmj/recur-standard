@@ -1,4 +1,4 @@
-# Cross-System Consent Identity  
+# Cross-System Authorization Identity  
 ### Formal Companion to RIP-009
 
 **Status:** Informational  
@@ -10,7 +10,7 @@
 
 ## 1. Overview
 
-The **Cross-System Consent Identity** defines the structural condition under which two independent systems will reach the same verdict ("valid" or "invalid") when verifying a signed RIP-001 Authorization.
+The **Cross-System Authorization Identity** defines the structural condition under which two independent systems will reach the same verdict ("valid" or "invalid") when verifying a signed RIP-001 Authorization.
 
 RIP-009 expresses this rule:
 
@@ -93,7 +93,7 @@ It does **not** mandate how domains must be chosen; it only defines what happens
 
 ---
 
-## 4. Consent Digest
+## 4. Authorization Digest
 
 RIP-001 and RIP-009 use the EIP-712 digest:
 
@@ -107,11 +107,11 @@ digest = keccak256(
 );
 ~~~
 
-This digest is the **consent identity** for the Authorization within that domain.
+This digest is the **authorization identity** for the Authorization within that domain.
 
 ---
 
-## 5. The Cross-System Consent Identity
+## 5. The Cross-System Authorization Identity
 
 ### 5.1 Definition
 
@@ -120,7 +120,7 @@ Let two systems A and B compute:
 - `domainSeparator_A`, `domainSeparator_B`  
 - `structHash_A(Auth)`, `structHash_B(Auth)`
 
-They share a **consent identity** *iff*:
+They share an **authorization identity** *iff*:
 
 ~~~text
 domainSeparator_A == domainSeparator_B
@@ -155,7 +155,7 @@ then:
 Verify_A(digest, sig) == Verify_B(digest, sig)
 ~~~
 
-This is the **Cross-System Consent Identity**.
+This is the **Cross-System Authorization Identity**.
 
 No consensus, state, or chain-local metadata affects this outcome.
 
@@ -169,7 +169,7 @@ RIP-009 standardizes:
 - **how** they must compute `structHash` and `domainSeparator`  
 - **how** to perform verification deterministically  
 
-The Cross-System Consent Identity explains **why** RIP-009 works:
+The Cross-System Authorization Identity explains **why** RIP-009 works:
 
 > If two systems compute the same inputs, they must compute the same verdict.
 
@@ -226,7 +226,7 @@ This is expected and correct.
 
 ## 9. Summary
 
-The Cross-System Consent Identity states:
+The Cross-System Authorization Identity states:
 
 > **Signature verification for a RIP-001 Authorization is identical across systems  
 > when and only when they reconstruct the same `(domainSeparator, structHash)` pair.**
